@@ -5,7 +5,8 @@ from src.models import (StudentSearchResults,
 
 
 class Evaluator:
-    """Measures retrieval quality using Recall@k against ground-truth annotations.
+    """Measures retrieval quality using Recall@k against ground-truth
+    annotations.
 
     A retrieved source counts as a hit when it overlaps at least 5% with
     any ground-truth source, measured in characters over ground-truth length:
@@ -25,12 +26,8 @@ class Evaluator:
         evaluator.print_report(metrics)
     """
 
-    def compute_recall(
-        self,
-        student_path: str,
-        ground_truth_path: str,
-        k: int = 10,
-    ) -> dict[str, Any]:
+    def compute_recall(self, student_path: str, ground_truth_path: str,
+                       k: int = 10) -> dict[str, Any]:
         """Compute Recall@1, @3, @5 and @k against ground-truth sources.
 
         Args:
@@ -69,7 +66,8 @@ class Evaluator:
                 top_k = retrieved[:kv]
                 found = sum(
                     1 for gt in gt_sources
-                    if any(self._overlap_ratio(gt, ret) >= 0.05 for ret in top_k)
+                    if any(self._overlap_ratio(gt, ret) >= 0.05
+                           for ret in top_k)
                 )
                 recall_sums[kv] += found / len(gt_sources)
 
@@ -92,11 +90,9 @@ class Evaluator:
             bar = "█" * int(score * 20)
             print(f"Recall@{ki:2d}: {score:.3f}  {bar}")
 
-
     @staticmethod
-    def _build_gt_lookup(
-        gt_data: RagDataset,
-    ) -> dict[str, list[tuple[str, int, int]]]:
+    def _build_gt_lookup(gt_data: RagDataset
+                         ) -> dict[str, list[tuple[str, int, int]]]:
         """Build a question_id → source ranges lookup from a RagDataset.
 
         Args:
@@ -109,17 +105,17 @@ class Evaluator:
         for q in gt_data.rag_questions:
             if isinstance(q, AnsweredQuestion):
                 lookup[q.question_id] = [
-                    (s.file_path, s.first_character_index, s.last_character_index)
+                    (s.file_path, s.first_character_index,
+                     s.last_character_index)
                     for s in q.sources
                 ]
         return lookup
 
     @staticmethod
-    def _overlap_ratio(
-        gt: tuple[str, int, int],
-        ret: tuple[str, int, int],
-    ) -> float:
-        """Return the fraction of the ground-truth range covered by a retrieved chunk.
+    def _overlap_ratio(gt: tuple[str, int, int],
+                       ret: tuple[str, int, int]) -> float:
+        """Return the fraction of the ground-truth range covered by a
+        retrieved chunk.
 
         Args:
             gt: (file_path, first_char, last_char) ground-truth source.

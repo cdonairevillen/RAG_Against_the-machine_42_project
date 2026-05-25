@@ -6,8 +6,10 @@ from src.models import MinimalSource
 SYSTEM_PROMPT = """You are a precise technical assistant for the vLLM codebase.
 Answer ONLY using the context provided below.
 Do NOT use prior knowledge or make assumptions beyond what the context states.
-If the answer is not present in the context, respond with: "Not found in the provided sources."
-Keep your answer concise, self-contained, and cite the source file(s) you used."""
+If the answer is not present in the context, respond with: "Not found in the
+provided sources."
+Keep your answer concise, self-contained, and cite the source file(s) you
+used."""
 
 
 def _build_prompt(question: str, context_blocks: list[str]) -> str:
@@ -42,7 +44,8 @@ def _build_prompt(question: str, context_blocks: list[str]) -> str:
 
 
 class Generator:
-    """Loads Qwen/Qwen3-0.6B and generates grounded answers via greedy decoding.
+    """Loads Qwen/Qwen3-0.6B and generates grounded answers via greedy
+    decoding.
 
     Greedy decoding: at each step, pick the token with the highest logit.
     This is deterministic and avoids hallucination drift from sampling.
@@ -63,11 +66,9 @@ class Generator:
 
     MODEL_NAME = "Qwen/Qwen3-0.6B"
 
-    def __init__(
-        self,
-        max_new_tokens: int = 150,
-        repo_root: str = "data/raw/vllm-0.10.1",
-    ) -> None:
+    def __init__(self,
+                 max_new_tokens: int = 150,
+                 repo_root: str = "data/raw/vllm-0.10.1") -> None:
         """Load the LLM. This is the slow step (~30-60s on first run).
 
         Args:
@@ -81,7 +82,6 @@ class Generator:
         self.max_new_tokens = max_new_tokens
         self.repo_root = repo_root
         print("Model loaded.")
-
 
     def answer(self, question: str, sources: list[MinimalSource]) -> str:
         """Generate a grounded answer for a question given retrieved sources.
@@ -103,11 +103,9 @@ class Generator:
         prompt = self._truncate_prompt(prompt)
         return self._greedy_decode(prompt)
 
-    def answer_batch(
-        self,
-        questions: list[str],
-        sources_list: list[list[MinimalSource]],
-    ) -> list[str]:
+    def answer_batch(self, questions: list[str],
+                     sources_list: list[list[MinimalSource]]
+                     ) -> list[str]:
         """Generate answers for multiple questions.
 
         Args:

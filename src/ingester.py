@@ -2,6 +2,8 @@ import ast
 import json
 import os
 import bm25s
+import numpy as np
+from transformer import SentenceTransformer
 from dataclasses import dataclass, asdict
 from typing import Generator
 from tqdm import tqdm
@@ -82,13 +84,8 @@ def _walk_repo(repo_root: str) -> Generator[str, None, None]:
                 yield abs_path
 
 
-def _split_by_size(
-    text: str,
-    file_path: str,
-    chunk_type: str,
-    max_chunk_size: int,
-    start_offset: int = 0,
-) -> list[Chunk]:
+def _split_by_size(text: str, file_path: str, chunk_type: str,
+                   max_chunk_size: int, start_offset: int = 0) -> list[Chunk]:
     """Split a text block into chunks of at most max_chunk_size chars.
 
     Breaks on newlines where possible to avoid cutting mid-line.
@@ -118,21 +115,18 @@ def _split_by_size(
                 file_path=file_path,
                 first_character_index=start_offset + pos,
                 last_character_index=start_offset + end,
-                chunk_type=chunk_type,
-            ))
+                chunk_type=chunk_type))
         pos = end
     return chunks
 
 
-def chunk_python_file(
-    file_path: str,
-    content: str,
-    max_chunk_size: int = 2000,
-) -> list[Chunk]:
+def chunk_python_file(file_path: str, content: str,
+                      max_chunk_size: int = 2000) -> list[Chunk]:
     """Chunk a Python file using the AST to keep logical units intact.
 
     Extracts top-level functions and classes as individual chunks.
-    Falls back to size-based splitting for oversized units or unparseable files.
+    Falls back to size-based splitting for oversized units or unparseable
+    files.
     Module-level code (imports, constants) becomes a preamble chunk.
 
     Args:
@@ -191,7 +185,8 @@ def chunk_python_file(
             ))
         else:
             chunks.extend(
-                _split_by_size(node_text, file_path, "python", max_chunk_size, first)
+                _split_by_size(node_text, file_path, "python", max_chunk_size,
+                               first)
             )
 
     covered_sorted = sorted(covered)
@@ -217,11 +212,8 @@ def chunk_python_file(
     return chunks
 
 
-def chunk_markdown_file(
-    file_path: str,
-    content: str,
-    max_chunk_size: int = 2000,
-) -> list[Chunk]:
+def chunk_markdown_file(file_path: str, content: str,
+                        max_chunk_size: int = 2000) -> list[Chunk]:
     """Chunk a Markdown or RST file by splitting on header lines.
 
     Each section (header to next header) becomes one chunk.
@@ -290,7 +282,8 @@ class Ingester:
     """Reads the vLLM repository, chunks it, and builds a BM25 index.
 
     Usage:
-        ingester = Ingester(repo_root="data/raw/vllm-0.10.1", max_chunk_size=2000)
+        ingester = Ingester(repo_root="data/raw/vllm-0.10.1",
+        max_chunk_size=2000)
         ingester.build()
         ingester.save("data/processed")
 
@@ -302,10 +295,15 @@ class Ingester:
         max_chunk_size: Maximum characters per chunk.
         chunks: All Chunk objects produced by build().
         retriever: Fitted bm25s.BM25 instance produced by build().
+
+    EMBEDDINGS:
+        
     """
 
     CHUNKS_FILE = "chunks.json"
     INDEX_DIR = "bm25_index"
+    EMBEDDINGS_FILE = "embeddings.npy"
+    EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
     def __init__(self, repo_root: str, max_chunk_size: int = 2000) -> None:
         """Initialize the Ingester.
@@ -318,11 +316,14 @@ class Ingester:
         self.max_chunk_size = max_chunk_size
         self.chunks: list[Chunk] = []
         self.retriever: bm25s.BM25 | None = None
+        self.embeddings: np.ndarray | None = None
 
-    def build(self) -> None:
+    def build(self, use_embeddings: bool = True) -> None:
         """Ingest the repository: chunk all files and fit the BM25 index."""
         self.chunks = self._collect_chunks()
         self.retriever = self._build_bm25(self.chunks)
+        if use_embeddings:
+            self.embeddings = self._build_embeddings(self.chunks)
 
     def save(self, output_dir: str) -> None:
         """Persist chunks and BM25 index to disk.
@@ -343,11 +344,17 @@ class Ingester:
 
         chunks_path = os.path.join(chunks_dir, self.CHUNKS_FILE)
         with open(chunks_path, "w", encoding="utf-8") as fh:
-            json.dump([c.to_dict() for c in self.chunks], fh, ensure_ascii=False)
+            json.dump([c.to_dict() for c in self.chunks], fh,
+                      ensure_ascii=False)
 
         self.retriever.save(index_dir)
         print(f"Saved {len(self.chunks)} chunks → {chunks_dir}")
         print(f"Saved BM25 index → {index_dir}")
+
+        if self.embeddings is not None:
+            embed_path = os.path.join(output_dir, self.EMBEDDINGS_FILE)
+            np.save(embed_path, self.embeddings)
+            print(f"Saved embeddings {self.embeddings.shape} → {embed_path}")
 
     @classmethod
     def load(cls, processed_dir: str) -> "Ingester":
@@ -379,9 +386,10 @@ class Ingester:
         files = list(_walk_repo(self.repo_root))
 
         for abs_path in tqdm(files, desc="Chunking files"):
-            rel_path = os.path.relpath(abs_path)  # relativo al CWD del proyecto
+            rel_path = os.path.relpath(abs_path)  # relativo al CWD del proyecto (revisar)
             try:
-                with open(abs_path, "r", encoding="utf-8", errors="ignore") as fh:
+                with (open(abs_path, "r", encoding="utf-8", errors="ignore")
+                      as fh):
                     content = fh.read()
             except OSError:
                 continue
@@ -419,3 +427,9 @@ class Ingester:
         retriever = bm25s.BM25()
         retriever.index(tokenized, show_progress=True)
         return retriever
+
+    def _build_embeddings(self, chunks: list[Chunk]) -> np.ndarray:
+        model = SentenceTransformer(self.EMBED_MODEL)
+        texts = [c.text for c in chunks]
+        embeddings = model.encode(texts, normalice_embeddings=True)
+        return embeddings

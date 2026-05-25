@@ -31,12 +31,16 @@ class CLI:
         uv run python -m src search "How to configure OpenAI server?" --k 10
         uv run python -m src answer "How to configure OpenAI server?" --k 10
         uv run python -m src search_dataset \\
-            --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json
+            --dataset_path data/datasets/UnansweredQuestions/
+            dataset_docs_public.json
         uv run python -m src answer_dataset \\
-            --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json
+            --dataset_path data/datasets/UnansweredQuestions/
+            dataset_docs_public.json
         uv run python -m src evaluate \\
-            --student_answer_path data/output/search_results/dataset_docs_public.json \\
-            --dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json
+            --student_answer_path data/output/search_results/
+            dataset_docs_public.json \\
+            --dataset_path data/datasets/AnsweredQuestions/
+            dataset_docs_public.json
     """
 
     def __init__(self, processed_dir: str = PROCESSED_DIR,
@@ -55,8 +59,9 @@ class CLI:
         self._retriever: Optional[object] = None
         self._generator: Optional[object] = None
 
-    def _get_retriever(self) -> Retriever:  # type: ignore[name-defined]
-        """Load and cache the Retriever. Subsequent calls return the same instance.
+    def _get_retriever(self) -> "Retriever":  # type: ignore[name-defined]
+        """Load and cache the Retriever. Subsequent calls return the same
+        instance.
 
         Returns:
             The loaded Retriever instance.
@@ -74,8 +79,9 @@ class CLI:
                 raise
         return self._retriever  # type: ignore[return-value]
 
-    def _get_generator(self) -> Generator:
-        """Load and cache the Generator (LLM). Subsequent calls return the same instance.
+    def _get_generator(self) -> "Generator":
+        """Load and cache the Generator (LLM). Subsequent calls return
+        the same instance.
 
         Returns:
             The loaded Generator instance.
@@ -91,7 +97,6 @@ class CLI:
                 print(f"Error loading model: {e}")
                 raise
         return self._generator  # type: ignore[return-value]
-
 
     def index(self, repo_root: str = REPO_ROOT,
               max_chunk_size: int = 2000,
@@ -110,7 +115,8 @@ class CLI:
             print(f"Expected: {os.path.abspath(repo_root)}")
             return
         try:
-            ingester = Ingester(repo_root=repo_root, max_chunk_size=max_chunk_size)
+            ingester = Ingester(repo_root=repo_root,
+                                max_chunk_size=max_chunk_size)
             ingester.build()
             ingester.save(output_dir)
             print("Ingestion complete! Indices saved under", output_dir)
@@ -139,13 +145,14 @@ class CLI:
             return
         for i, source in enumerate(results, 1):
             print(f"[{i}] {source.file_path} "
-                  f"({source.first_character_index}:{source.last_character_index})")
-
+                  f"({source.first_character_index}:"
+                  f"{source.last_character_index})")
 
     def search_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/search_results"
                        ) -> None:
-        """Run retrieval over every question in a dataset JSON and save results.
+        """Run retrieval over every question in a dataset JSON and save
+        results.
 
         Args:
             dataset_path: Path to a RagDataset JSON (answered or unanswered).
@@ -182,9 +189,9 @@ class CLI:
             label="student_search_results",
         )
 
-
     def answer(self, query: str, k: int = 10) -> None:
-        """Answer a single question using retrieved context and print the result.
+        """Answer a single question using retrieved context and print the
+        result.
 
         Args:
             query: Natural-language question.
@@ -326,10 +333,9 @@ class CLI:
         except Exception as e:
             print(f"Error during evaluation: {e}")
 
-
     @staticmethod
-    def _save_json(model: object, directory: str,filename: str,
-                   label: str) -> None:
+    def _save_json(model: object, directory: str,
+                   filename: str, label: str) -> None:
         """Serialize a Pydantic model to JSON and write it to disk.
 
         Args:

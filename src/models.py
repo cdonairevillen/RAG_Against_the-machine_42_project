@@ -9,8 +9,10 @@ class MinimalSource(BaseModel):
 
     Attributes:
         file_path: Relative path to the source file inside the repository.
-        first_character_index: Start position of the chunk in the file (inclusive).
-        last_character_index: End position of the chunk in the file (exclusive).
+        first_character_index: Start position of the chunk in the file
+        (inclusive).
+        last_character_index: End position of the chunk in the file
+        (exclusive).
     """
 
     file_path: str
@@ -76,7 +78,6 @@ class MinimalAnswer(MinimalSearchResults):
     answer: str
 
 
-# Subject-spec names — the moulinette validates against these exactly
 class StudentSearchResults(BaseModel):
     """Output of the search_dataset command (subject-spec name).
 

@@ -108,7 +108,8 @@ class Retriever:
     @staticmethod
     def _overlap_ratio(gt: tuple[str, int, int],
                        ret: tuple[str, int, int]) -> float:
-        """Return the fraction of the ground-truth range covered by a retrieved chunk.
+        """Return the fraction of the ground-truth range covered by a
+        retrieved chunk.
 
         Args:
             gt: (file_path, first_char, last_char) ground-truth source.
