@@ -1,0 +1,35 @@
+[project]
+name = "student"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+dependencies = [
+    "pydantic",
+    "bm25s",
+    "tqdm",
+    "fire",
+    "flake8",
+    "mypy",
+    "llm-sdk",
+]
+
+[tool.uv.sources]
+llm-sdk = { path = "./llm_sdk", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "."
+explicit_package_bases = true
+
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+disallow_untyped_defs = true
+check_untyped_defs = true

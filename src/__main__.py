@@ -1,0 +1,11 @@
+from src.cli import CLI
+import fire
+
+
+def main() -> None:
+    """Launch the RAG CLI."""
+    fire.Fire(CLI)
+
+
+if __name__ == "__main__":
+    main()
