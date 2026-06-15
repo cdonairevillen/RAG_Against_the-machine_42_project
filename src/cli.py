@@ -4,7 +4,7 @@ import os
 from typing import Optional
 from tqdm import tqdm
 from src.models import (MinimalAnswer,
-                        MinimalStudentSearchResults,
+                        MinimalSearchResults,
                         RagDataset,
                         StudentSearchResults,
                         StudentSearchResultsAndAnswer,
@@ -199,10 +199,10 @@ class CLI:
         except Exception:
             return
 
-        results: list[MinimalStudentSearchResults] = []
+        results: list[MinimalSearchResults] = []
         for question in tqdm(dataset.rag_questions, desc="Searching"):
-            sources = retriever.search(question.question, k=k)
-            results.append(MinimalStudentSearchResults(
+            sources = retriever.search_with_fallback(question.question, k=k)
+            results.append(MinimalSearchResults(
                 question_id=question.question_id,
                 question=question.question,
                 retrieved_sources=sources,
@@ -295,13 +295,13 @@ class CLI:
                 return
 
         answers: list[MinimalAnswer] = []
-        search_only: list[MinimalStudentSearchResults] = []
+        search_only: list[MinimalSearchResults] = []
         desc = "Retrieving" if skip_generation else "RAG pipeline"
 
         for question in tqdm(dataset.rag_questions, desc=desc):
             if skip_generation:
                 sources = retriever.search(question.question, k=k)
-                search_only.append(MinimalStudentSearchResults(
+                search_only.append(MinimalSearchResults(
                     question_id=question.question_id,
                     question=question.question,
                     retrieved_sources=sources,

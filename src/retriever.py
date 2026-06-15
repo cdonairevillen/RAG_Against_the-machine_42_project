@@ -108,6 +108,10 @@ class Retriever:
         self.embeddings = embeddings
         self.embed_model = None
         self.reranker = None
+        self.bm25_docs: Optional[bm25s.BM25] = None
+        self.bm25_code: Optional[bm25s.BM25] = None
+        self.doc_indices: list[int] = []
+        self.code_indices: list[int] = []
 
         if embeddings is not None:
             self.load_embed_model()
@@ -155,11 +159,16 @@ class Retriever:
         ingester = Ingester.load(processed_dir)
         if ingester.bm25 is None:
             raise RuntimeError("BM25 index failed to load from disk.")
-        return cls(
+        retriever = cls(
             chunks=ingester.chunks,
             bm25=ingester.bm25,
             embeddings=ingester.embeddings,
         )
+        retriever.bm25_docs = ingester.bm25_docs
+        retriever.bm25_code = ingester.bm25_code
+        retriever.doc_indices = ingester.doc_indices
+        retriever.code_indices = ingester.code_indices
+        return retriever
 
     def search(self, query: str, k: int = 10) -> list[MinimalSource]:
         """Fast retrieval for evaluation — BM25 with query expansion only.
@@ -180,7 +189,7 @@ class Retriever:
 
         if self.embeddings is not None and self.embed_model is not None:
             return self.search_hybrid(expanded, k)
-        return self.search_bm25(expanded, k)
+        return self.search_bm25(expanded, k, min_score=0.0)
 
     def search_for_generation(self, query: str,
                               k: int = 10) -> list[MinimalSource]:
@@ -209,9 +218,81 @@ class Retriever:
         if self.embeddings is not None and self.embed_model is not None:
             candidates = self.search_hybrid(expanded, fetch_k)
         else:
-            candidates = self.search_bm25(expanded, fetch_k)
+            candidates = self.search_bm25(expanded, fetch_k, min_score=1.0)
 
         return self.rerank(query, candidates, k)
+
+    def search_with_fallback(
+        self, query: str, k: int = 10
+    ) -> list[MinimalSource]:
+        """Triple-index search with majority-vote subindex selection.
+
+        First searches the general index to detect query type (doc vs code)
+        from the top-3 results. Then refines in the winning subindex.
+        Falls back to general results if subindices are unavailable.
+
+        Args:
+            query: Natural-language search string.
+            k: Number of results to return.
+
+        Returns:
+            Ranked list of MinimalSource objects.
+        """
+        if not query or not query.strip() or k <= 0:
+            return []
+
+        if self.bm25_docs is None or self.bm25_code is None:
+            return self.search(query, k)
+
+        expanded = expand_query(query, self.chunks)
+
+        # Step 1 — general search to detect query type
+        general = self.search_bm25(expanded, 3, min_score=0.0)
+        if not general:
+            return []
+
+        # Step 2 — majority vote on chunk type
+        doc_count = 0
+        code_count = 0
+        chunk_map = {
+            (c.file_path, c.first_character_index): c
+            for c in self.chunks
+        }
+        for source in general:
+            chunk = chunk_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if chunk and chunk.chunk_type == "doc":
+                doc_count += 1
+            elif chunk and chunk.chunk_type == "code":
+                code_count += 1
+
+        # Step 3 — refine in the winning subindex
+        if doc_count > code_count:
+            subindex = self.bm25_docs
+            global_map = self.doc_indices
+        elif code_count > doc_count:
+            subindex = self.bm25_code
+            global_map = self.code_indices
+        else:
+            return self.search_bm25(expanded, k, min_score=0.0)
+
+        try:
+            tokenized = bm25s.tokenize(
+                [expanded], stopwords="en", show_progress=False
+            )
+            effective_k = min(k, len(global_map))
+            results, _ = subindex.retrieve(
+                tokenized, k=effective_k, show_progress=False
+            )
+            local_indices: list[int] = results[0].tolist()
+        except Exception:
+            return self.search_bm25(expanded, k, min_score=0.0)
+
+        return [
+            self.chunk_to_source(self.chunks[global_map[int(i)]])
+            for i in local_indices
+        ]
 
     def search_batch(self, questions: list[str],
                      k: int = 10) -> list[list[MinimalSource]]:
@@ -225,11 +306,12 @@ class Retriever:
             List of MinimalSource lists, one per question, same order.
         """
         return [
-            self.search(q, k=k)
+            self.search_with_fallback(q, k=k)
             for q in tqdm(questions, desc="Searching")
         ]
 
-    def search_bm25(self, query: str, k: int) -> list[MinimalSource]:
+    def search_bm25(self, query: str, k: int,
+                    min_score: float = 0.0) -> list[MinimalSource]:
         """BM25-only retrieval over the unified index.
 
         Args:
@@ -244,14 +326,38 @@ class Retriever:
                 [query], stopwords="en", show_progress=False
             )
             effective_k = min(k, len(self.chunks))
-            results, _ = self.bm25.retrieve(
+            results, scores = self.bm25.retrieve(
                 tokenized, k=effective_k, show_progress=False
             )
             indices: list[int] = results[0].tolist()
+            result_scores: list[float] = scores[0].tolist()
         except Exception:
             return []
 
-        return [self.chunk_to_source(self.chunks[idx]) for idx in indices]
+        return [self.chunk_to_source(self.chunks[int(idx)])
+                for idx, score in zip(indices, result_scores)
+                if score >= min_score]
+
+    def get_top_bm25_score(self, query: str) -> float:
+
+        """Returns the highest BM25 score for a query over the corpus
+
+        Args:
+            query: Search thing
+
+        Returns:
+        Highest score, or 0.0 on error.
+        """
+        try:
+            tokenized = bm25s.tokenize([query], stopwords="en",
+                                       show_progress=False)
+
+            _, scores = self.bm25.retrieve(tokenized, k=1, show_progress=False)
+
+            return float(scores[0][0])
+
+        except Exception:
+            return 0.0
 
     def search_hybrid(self, query: str, k: int) -> list[MinimalSource]:
         """Hybrid retrieval: BM25 + semantic embeddings fused with RRF.
@@ -263,6 +369,10 @@ class Retriever:
         Returns:
             Ranked MinimalSource list.
         """
+        top_scores = self.get_top_bm25_score(query)
+        if top_scores < 1.0:
+            return []
+
         fetch_k = min(k * 2, len(self.chunks))
         rrf_scores: dict[int, float] = {}
 

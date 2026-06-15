@@ -18,13 +18,12 @@ install:
 	mkdir -p $(BASE) $(CACHE) $(TMP) $(HF)
 	mkdir -p data/raw data/processed data/output data/datasets
 	$(ENV) $(UV) venv $(VENV)
-	$(ENV) $(UV) sync
 
 run:
 	$(ENV) $(UV) run --project . $(PY) -m src $(ARGS)
 
 web:
-    $(ENV) $(UV) run streamlit run src/web.py
+	$(ENV) $(UV) run streamlit run src/web.py
 
 index:
 	$(ENV) $(UV) run --project . $(PY) -m src index \
@@ -73,7 +72,7 @@ clean:
 	rm -rf .mypy_cache
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 
-meme: web
+meme:index-fast web
 	@echo "Killing in the name of... bad retrieval scores"
 	@xdg-open "https://www.youtube.com/watch?v=bWXazVhlyxQ" 2>/dev/null || \
 		open "https://www.youtube.com/watch?v=bWXazVhlyxQ" 2>/dev/null || \

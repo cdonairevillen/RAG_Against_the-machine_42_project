@@ -51,7 +51,7 @@ class RagDataset(BaseModel):
     rag_questions: List[AnsweredQuestion | UnansweredQuestion]
 
 
-class MinimalStudentSearchResults(BaseModel):
+class MinimalSearchResults(BaseModel):
     """Search results for a single question.
 
     Attributes:
@@ -65,7 +65,7 @@ class MinimalStudentSearchResults(BaseModel):
     retrieved_sources: List[MinimalSource]
 
 
-class MinimalAnswer(MinimalStudentSearchResults):
+class MinimalAnswer(MinimalSearchResults):
     """Search results for a single question plus the generated answer.
 
     Attributes:
@@ -79,11 +79,11 @@ class StudentSearchResults(BaseModel):
     """Output of the search_dataset command.
 
     Attributes:
-        search_results: One MinimalStudentSearchResults entry per question.
+        search_results: One MinimalSearchResults entry per question.
         k: Number of chunks retrieved per question.
     """
 
-    search_results: List[MinimalStudentSearchResults]
+    search_results: List[MinimalSearchResults]
     k: int
 
 

@@ -4,7 +4,6 @@ import os
 import shutil
 from dataclasses import dataclass, field, asdict
 from typing import Generator, Optional
-
 import bm25s
 import numpy as np
 from tqdm import tqdm
@@ -86,14 +85,9 @@ def walk_repo(repo_root: str) -> Generator[str, None, None]:
                 yield abs_path
 
 
-def split_by_size(
-    text: str,
-    file_path: str,
-    chunk_type: str,
-    max_chunk_size: int,
-    start_offset: int = 0,
-    symbols: str = "",
-) -> list[Chunk]:
+def split_by_size(text: str, file_path: str, chunk_type: str,
+                  max_chunk_size: int, start_offset: int = 0,
+                  symbols: str = "") -> list[Chunk]:
     """Split text into overlapping chunks of at most max_chunk_size chars.
 
     Each chunk overlaps the previous by OVERLAP_RATIO * max_chunk_size
@@ -177,11 +171,9 @@ def extract_symbols(node: ast.AST) -> str:
     return " ".join(dict.fromkeys(names))
 
 
-def chunk_python_file(
-    file_path: str,
-    content: str,
-    max_chunk_size: int = DEFAULT_CODE_CHUNK_SIZE,
-) -> list[Chunk]:
+def chunk_python_file(file_path: str, content: str,
+                      max_chunk_size: int = DEFAULT_CODE_CHUNK_SIZE
+                      ) -> list[Chunk]:
     """Chunk a Python file using the AST to keep logical units intact.
 
     AST symbol names are stored in Chunk.symbols, not in Chunk.text,
@@ -385,6 +377,10 @@ class Ingester:
         self.doc_chunk_size = doc_chunk_size
         self.chunks: list[Chunk] = []
         self.bm25: Optional[bm25s.BM25] = None
+        self.bm25_docs: Optional[bm25s.BM25] = None
+        self.bm25_code: Optional[bm25s.BM25] = None
+        self.doc_indices: list[int] = []
+        self.code_indices: list[int] = []
         self.embeddings: Optional[np.ndarray] = None
 
     def build(self, use_embeddings: bool = True) -> None:
@@ -396,6 +392,18 @@ class Ingester:
         """
         self.chunks = self.collect_chunks()
         self.bm25 = self.build_bm25(self.chunks)
+        self.doc_indices = [
+            i for i, c in enumerate(self.chunks) if c.chunk_type == "doc"
+        ]
+        self.code_indices = [
+            i for i, c in enumerate(self.chunks) if c.chunk_type == "code"
+        ]
+        self.bm25_docs = self.build_bm25(
+            [self.chunks[i] for i in self.doc_indices], label="docs"
+        )
+        self.bm25_code = self.build_bm25(
+            [self.chunks[i] for i in self.code_indices], label="code"
+        )
         if use_embeddings:
             self.embeddings = self.build_embeddings(self.chunks)
 
@@ -426,6 +434,19 @@ class Ingester:
         index_dir = os.path.join(output_dir, self.INDEX_DIR)
         os.makedirs(index_dir, exist_ok=True)
         self.bm25.save(index_dir)
+        docs_dir = os.path.join(output_dir, "bm25_docs")
+        code_dir = os.path.join(output_dir, "bm25_code")
+        os.makedirs(docs_dir, exist_ok=True)
+        os.makedirs(code_dir, exist_ok=True)
+        self.bm25_docs.save(docs_dir)
+        self.bm25_code.save(code_dir)
+
+        meta_path = os.path.join(output_dir, "meta.json")
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "doc_indices": self.doc_indices,
+                "code_indices": self.code_indices,
+            }, fh)
 
         doc_count = sum(1 for c in self.chunks if c.chunk_type == "doc")
         code_count = sum(1 for c in self.chunks if c.chunk_type == "code")
@@ -462,6 +483,26 @@ class Ingester:
 
         index_dir = os.path.join(processed_dir, cls.INDEX_DIR)
         ingester.bm25 = bm25s.BM25.load(index_dir, load_corpus=False)
+
+        docs_dir = os.path.join(processed_dir, "bm25_docs")
+        code_dir = os.path.join(processed_dir, "bm25_code")
+        meta_path = os.path.join(processed_dir, "meta.json")
+
+        if os.path.isdir(docs_dir) and os.path.isdir(code_dir):
+            ingester.bm25_docs = bm25s.BM25.load(docs_dir, load_corpus=False)
+            ingester.bm25_code = bm25s.BM25.load(code_dir, load_corpus=False)
+        else:
+            ingester.bm25_docs = None
+            ingester.bm25_code = None
+
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            ingester.doc_indices = meta["doc_indices"]
+            ingester.code_indices = meta["code_indices"]
+        else:
+            ingester.doc_indices = []
+            ingester.code_indices = []
 
         embed_path = os.path.join(processed_dir, cls.EMBEDDINGS_FILE)
         if os.path.isfile(embed_path):
@@ -520,9 +561,8 @@ class Ingester:
 
         return all_chunks
 
-    def build_bm25(
-        self, chunks: list[Chunk], label: str = "corpus"
-    ) -> bm25s.BM25:
+    def build_bm25(self, chunks: list[Chunk],
+                   label: str = "corpus") -> bm25s.BM25:
         """Tokenize all chunks and fit a unified BM25 model.
 
         Only Chunk.text is used — Chunk.symbols is excluded from the
