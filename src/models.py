@@ -1,6 +1,5 @@
 import uuid
 from typing import List
-
 from pydantic import BaseModel, Field
 
 
@@ -9,10 +8,8 @@ class MinimalSource(BaseModel):
 
     Attributes:
         file_path: Relative path to the source file inside the repository.
-        first_character_index: Start position of the chunk in the file
-        (inclusive).
-        last_character_index: End position of the chunk in the file
-        (exclusive).
+        first_character_index: Start position of the chunk (inclusive).
+        last_character_index: End position of the chunk (exclusive).
     """
 
     file_path: str
@@ -54,7 +51,7 @@ class RagDataset(BaseModel):
     rag_questions: List[AnsweredQuestion | UnansweredQuestion]
 
 
-class MinimalSearchResults(BaseModel):
+class MinimalStudentSearchResults(BaseModel):
     """Search results for a single question.
 
     Attributes:
@@ -68,7 +65,7 @@ class MinimalSearchResults(BaseModel):
     retrieved_sources: List[MinimalSource]
 
 
-class MinimalAnswer(MinimalSearchResults):
+class MinimalAnswer(MinimalStudentSearchResults):
     """Search results for a single question plus the generated answer.
 
     Attributes:
@@ -79,19 +76,19 @@ class MinimalAnswer(MinimalSearchResults):
 
 
 class StudentSearchResults(BaseModel):
-    """Output of the search_dataset command (subject-spec name).
+    """Output of the search_dataset command.
 
     Attributes:
-        search_results: One MinimalSearchResults entry per question.
+        search_results: One MinimalStudentSearchResults entry per question.
         k: Number of chunks retrieved per question.
     """
 
-    search_results: List[MinimalSearchResults]
+    search_results: List[MinimalStudentSearchResults]
     k: int
 
 
 class StudentSearchResultsAndAnswer(BaseModel):
-    """Output of the answer_dataset command (subject-spec name).
+    """Output of the answer_dataset command.
 
     Attributes:
         search_results: One MinimalAnswer entry per question.

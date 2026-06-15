@@ -1,12 +1,10 @@
 from typing import Any
 from src.models import (StudentSearchResults,
-                        RagDataset,
-                        AnsweredQuestion)
+                        RagDataset, AnsweredQuestion)
 
 
 class Evaluator:
-    """Measures retrieval quality using Recall@k against ground-truth
-    annotations.
+    """Measures retrieval quality using Recall@k against ground-truth sources.
 
     A retrieved source counts as a hit when it overlaps at least 5% with
     any ground-truth source, measured in characters over ground-truth length:
@@ -20,7 +18,9 @@ class Evaluator:
         evaluator = Evaluator()
         metrics = evaluator.compute_recall(
             student_path="data/output/search_results/dataset_docs_public.json",
-            ground_truth_path="data/datasets/AnsweredQuestions/dataset_docs_public.json",
+            ground_truth_path=(
+                "data/datasets/AnsweredQuestions/dataset_docs_public.json"
+            ),
             k=10,
         )
         evaluator.print_report(metrics)
@@ -41,17 +41,17 @@ class Evaluator:
                 "recall_at_k": dict[int, float] — recall per k cutoff.
         """
         with open(student_path, "r", encoding="utf-8") as fh:
-            student_data = StudentSearchResults.model_validate_json(fh.read())
+            st_dt = StudentSearchResults.model_validate_json(fh.read())
 
         with open(ground_truth_path, "r", encoding="utf-8") as fh:
             gt_data = RagDataset.model_validate_json(fh.read())
 
-        gt_lookup = self._build_gt_lookup(gt_data)
+        gt_lookup = self.build_gt_lookup(gt_data)
         k_values = sorted({1, 3, 5, k})
         recall_sums: dict[int, float] = {kv: 0.0 for kv in k_values}
         evaluated = 0
 
-        for entry in student_data.search_results:
+        for entry in st_dt.search_results:
             gt_sources = gt_lookup.get(entry.question_id)
             if not gt_sources:
                 continue
@@ -66,8 +66,10 @@ class Evaluator:
                 top_k = retrieved[:kv]
                 found = sum(
                     1 for gt in gt_sources
-                    if any(self._overlap_ratio(gt, ret) >= 0.05
-                           for ret in top_k)
+                    if any(
+                        self.overlap_ratio(gt, ret) >= 0.05
+                        for ret in top_k
+                    )
                 )
                 recall_sums[kv] += found / len(gt_sources)
 
@@ -90,10 +92,9 @@ class Evaluator:
             bar = "█" * int(score * 20)
             print(f"Recall@{ki:2d}: {score:.3f}  {bar}")
 
-    @staticmethod
-    def _build_gt_lookup(gt_data: RagDataset
-                         ) -> dict[str, list[tuple[str, int, int]]]:
-        """Build a question_id → source ranges lookup from a RagDataset.
+    def build_gt_lookup(self, gt_data: RagDataset
+                        ) -> dict[str, list[tuple[str, int, int]]]:
+        """Build a question_id to source ranges lookup from a RagDataset.
 
         Args:
             gt_data: Ground-truth RagDataset (AnsweredQuestions).
@@ -105,17 +106,19 @@ class Evaluator:
         for q in gt_data.rag_questions:
             if isinstance(q, AnsweredQuestion):
                 lookup[q.question_id] = [
-                    (s.file_path, s.first_character_index,
-                     s.last_character_index)
+                    (
+                        s.file_path,
+                        s.first_character_index,
+                        s.last_character_index,
+                    )
                     for s in q.sources
                 ]
         return lookup
 
-    @staticmethod
-    def _overlap_ratio(gt: tuple[str, int, int],
-                       ret: tuple[str, int, int]) -> float:
-        """Return the fraction of the ground-truth range covered by a
-        retrieved chunk.
+    def overlap_ratio(self, gt: tuple[str, int, int],
+                      ret: tuple[str, int, int]) -> float:
+        """Return fraction of the ground-truth range covered by a retrieved
+        chunk.
 
         Args:
             gt: (file_path, first_char, last_char) ground-truth source.

@@ -1,11 +1,14 @@
+from src.retriever import Retriever
+from src.generator import Generator
 import os
 from typing import Optional
 from tqdm import tqdm
 from src.models import (MinimalAnswer,
-                        MinimalSearchResults,
+                        MinimalStudentSearchResults,
                         RagDataset,
                         StudentSearchResults,
-                        StudentSearchResultsAndAnswer)
+                        StudentSearchResultsAndAnswer,
+                        MinimalSource)
 
 PROCESSED_DIR = "data/processed"
 REPO_ROOT = "data/raw/vllm-0.10.1"
@@ -14,150 +17,173 @@ REPO_ROOT = "data/raw/vllm-0.10.1"
 class CLI:
     """RAG against the Machine — single orchestrator and CLI entry point.
 
-    Owns one Retriever and one Generator instance, loaded lazily on first use
-    and reused for all subsequent calls within the same process. This avoids
-    reloading the BM25 index or the LLM weights between operations.
+    Loads Retriever and Generator lazily on first use and reuses them
+    for all subsequent calls within the same process.
+
+    Two retrieval modes are available:
+        search / search_dataset  — fast BM25-only, no reranker.
+        answer / answer_dataset  — BM25 + reranker before LLM generation.
 
     Commands:
-        index            Build the BM25 index from the vLLM repository.
-        search           Search for a single query and print sources.
-        search_dataset   Batch search over a full dataset JSON.
-        answer           Answer a single question end-to-end.
-        answer_dataset   Full pipeline: retrieve + generate over a dataset.
-        evaluate         Compute Recall@k against ground truth.
+        index           Build BM25 and optional embedding indices.
+        search          Search for a single query (fast, no reranker).
+        search_dataset  Batch retrieval over a full dataset JSON.
+        answer          Answer a single question (with reranker).
+        answer_dataset  Full pipeline: retrieve + rerank + generate.
+        evaluate        Compute Recall@k against ground truth.
 
     Examples:
         uv run python -m src index
         uv run python -m src search "How to configure OpenAI server?" --k 10
         uv run python -m src answer "How to configure OpenAI server?" --k 10
         uv run python -m src search_dataset \\
-            --dataset_path data/datasets/UnansweredQuestions/
-            dataset_docs_public.json
+            --dataset_path
+
+            data/datasets/UnansweredQuestions/dataset_docs_public.json
         uv run python -m src answer_dataset \\
-            --dataset_path data/datasets/UnansweredQuestions/
-            dataset_docs_public.json
+            --dataset_path
+
+            data/datasets/UnansweredQuestions/dataset_docs_public.json
         uv run python -m src evaluate \\
-            --student_answer_path data/output/search_results/
-            dataset_docs_public.json \\
-            --dataset_path data/datasets/AnsweredQuestions/
-            dataset_docs_public.json
+            --student_answer_path
+
+            data/output/search_results/dataset_docs_public.json \\
+            --dataset_path
+
+            data/datasets/AnsweredQuestions/dataset_docs_public.json
     """
 
     def __init__(self, processed_dir: str = PROCESSED_DIR,
                  repo_root: str = REPO_ROOT) -> None:
-        """Initialize the CLI orchestrator.
-
-        Retriever and Generator are NOT loaded here — they are lazy-loaded
-        on first use by _get_retriever() and _get_generator().
+        """Initialise the CLI orchestrator.
 
         Args:
             processed_dir: Directory containing chunks and BM25 index.
             repo_root: Root of the vLLM repository (used by Generator).
         """
-        self._processed_dir = processed_dir
-        self._repo_root = repo_root
-        self._retriever: Optional[object] = None
-        self._generator: Optional[object] = None
+        self.processed_dir = processed_dir
+        self.repo_root = repo_root
+        self.retriever: Optional[object] = None
+        self.generator: Optional[object] = None
 
-    def _get_retriever(self) -> "Retriever":  # type: ignore[name-defined]
-        """Load and cache the Retriever. Subsequent calls return the same
-        instance.
+    def get_retriever(self, with_reranker: bool = False) -> Retriever:
+        """Load and cache the Retriever.
+
+        Args:
+            with_reranker: When True, also loads the cross-encoder reranker.
 
         Returns:
             The loaded Retriever instance.
 
         Raises:
-            SystemExit: Prints an error and exits if the index is missing.
+            Exception: Propagates any load error after printing a message.
         """
-        if self._retriever is None:
-            from src.retriever import Retriever
+        if self.retriever is None:
             try:
-                self._retriever = Retriever.from_disk(self._processed_dir)
-            except Exception as e:
-                print(f"Error loading index from '{self._processed_dir}': {e}")
+                self.retriever = Retriever.from_disk(self.processed_dir)
+            except Exception as exc:
+                print(f"Error loading index: {exc}")
                 print("Have you run 'uv run python -m src index' yet?")
                 raise
-        return self._retriever  # type: ignore[return-value]
 
-    def _get_generator(self) -> "Generator":
-        """Load and cache the Generator (LLM). Subsequent calls return
-        the same instance.
+        if with_reranker and self.retriever.reranker is None:
+            self.retriever.load_reranker()
+
+        return self.retriever
+
+    def get_generator(self) -> Generator:
+        """Load and cache the Generator.
 
         Returns:
             The loaded Generator instance.
 
         Raises:
-            Exception: Propagates any model loading error.
+            Exception: Propagates any model load error.
         """
-        if self._generator is None:
-            from src.generator import Generator
+        if self.generator is None:
             try:
-                self._generator = Generator(repo_root=self._repo_root)
-            except Exception as e:
-                print(f"Error loading model: {e}")
+                self.generator = Generator(repo_root=self.repo_root)
+            except Exception as exc:
+                print(f"Error loading model: {exc}")
                 raise
-        return self._generator  # type: ignore[return-value]
+        return self.generator
 
-    def index(self, repo_root: str = REPO_ROOT,
-              max_chunk_size: int = 2000,
-              output_dir: str = PROCESSED_DIR) -> None:
-        """Ingest the vLLM repository and persist the BM25 index to disk.
+    def index(self, repo_root: str = REPO_ROOT, code_chunk_size: int = 1200,
+              doc_chunk_size: int = 2000, output_dir: str = PROCESSED_DIR,
+              use_embeddings: bool = True) -> None:
+        """Ingest the vLLM repository and persist BM25 and embedding indices.
 
         Args:
             repo_root: Path to the vLLM repository root.
-            max_chunk_size: Maximum characters per chunk (configurable).
-            output_dir: Where chunks and index are saved.
+            code_chunk_size: Maximum characters per code chunk.
+            doc_chunk_size: Maximum characters per doc chunk.
+            output_dir: Where chunks and indices are saved.
+            use_embeddings: Build semantic embedding index alongside BM25.
         """
         from src.ingester import Ingester
 
         if not os.path.isdir(repo_root):
             print(f"Error: repository not found at '{repo_root}'")
-            print(f"Expected: {os.path.abspath(repo_root)}")
             return
         try:
-            ingester = Ingester(repo_root=repo_root,
-                                max_chunk_size=max_chunk_size)
-            ingester.build()
+            ingester = Ingester(
+                repo_root=repo_root,
+                code_chunk_size=code_chunk_size,
+                doc_chunk_size=doc_chunk_size,
+            )
+            ingester.build(use_embeddings=use_embeddings)
             ingester.save(output_dir)
             print("Ingestion complete! Indices saved under", output_dir)
-        except Exception as e:
-            print(f"Error during indexing: {e}")
+        except Exception as exc:
+            print(f"Error during indexing: {exc}")
 
     def search(self, query: str, k: int = 10) -> None:
         """Search the knowledge base for a single query and print results.
 
+        Uses fast BM25-only retrieval — no reranker.
+
         Args:
-            query: Search string. Empty query exits cleanly without crashing.
+            query: Search string. Empty query exits cleanly.
             k: Number of results to retrieve.
         """
         if not query or not query.strip():
             print("Empty query — no results.")
             return
         try:
-            retriever = self._get_retriever()
+            retriever = self.get_retriever(with_reranker=False)
             results = retriever.search(query, k=k)
-        except Exception as e:
-            print(f"Error during search: {e}")
+        except Exception as exc:
+            print(f"Error during search: {exc}")
             return
 
         if not results:
             print("No results found.")
             return
+
+        print(f"\nPrompt: \"{query}\"\n")
         for i, source in enumerate(results, 1):
-            print(f"[{i}] {source.file_path} "
-                  f"({source.first_character_index}:"
-                  f"{source.last_character_index})")
+            chunk = self.find_chunk(retriever, source)
+            print(f"[{i}] filepath: {source.file_path}")
+            print(f"    chunk:    {i - 1}")
+            print(f"    range:    {source.first_character_index}:"
+                  f"{source.last_character_index}")
+            if chunk:
+                preview = chunk.text[:200].replace("\n", " ")
+                print(f"    text:     {preview}...")
+            print()
 
     def search_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/search_results"
                        ) -> None:
-        """Run retrieval over every question in a dataset JSON and save
-        results.
+        """Run fast retrieval over every question in a dataset JSON.
+
+        Uses BM25-only search without reranker for evaluation throughput.
 
         Args:
-            dataset_path: Path to a RagDataset JSON (answered or unanswered).
+            dataset_path: Path to a RagDataset JSON.
             k: Chunks to retrieve per question.
-            save_directory: Where the SearchResults JSON is written.
+            save_directory: Where the StudentSearchResults JSON is
+            written.
         """
         if not os.path.isfile(dataset_path):
             print(f"Error: dataset file not found: {dataset_path}")
@@ -165,24 +191,24 @@ class CLI:
         try:
             with open(dataset_path, "r", encoding="utf-8") as fh:
                 dataset = RagDataset.model_validate_json(fh.read())
-        except Exception as e:
-            print(f"Error reading dataset: {e}")
+        except Exception as exc:
+            print(f"Error reading dataset: {exc}")
             return
         try:
-            retriever = self._get_retriever()
+            retriever = self.get_retriever(with_reranker=False)
         except Exception:
             return
 
-        results: list[MinimalSearchResults] = []
+        results: list[MinimalStudentSearchResults] = []
         for question in tqdm(dataset.rag_questions, desc="Searching"):
             sources = retriever.search(question.question, k=k)
-            results.append(MinimalSearchResults(
+            results.append(MinimalStudentSearchResults(
                 question_id=question.question_id,
                 question=question.question,
                 retrieved_sources=sources,
             ))
 
-        self._save_json(
+        self.save_json(
             StudentSearchResults(search_results=results, k=k),
             save_directory,
             os.path.basename(dataset_path),
@@ -190,8 +216,7 @@ class CLI:
         )
 
     def answer(self, query: str, k: int = 10) -> None:
-        """Answer a single question using retrieved context and print the
-        result.
+        """Answer a single question using retrieved and reranked context.
 
         Args:
             query: Natural-language question.
@@ -201,10 +226,10 @@ class CLI:
             print("Empty query — nothing to answer.")
             return
         try:
-            retriever = self._get_retriever()
-            sources = retriever.search(query, k=k)
-        except Exception as e:
-            print(f"Error during retrieval: {e}")
+            retriever = self.get_retriever(with_reranker=True)
+            sources = retriever.search_for_generation(query, k=k)
+        except Exception as exc:
+            print(f"Error during retrieval: {exc}")
             return
 
         if not sources:
@@ -212,34 +237,39 @@ class CLI:
             return
 
         try:
-            generator = self._get_generator()
+            generator = self.get_generator()
             response = generator.answer(query, sources)
-        except Exception as e:
-            print(f"Error during generation: {e}")
+        except Exception as exc:
+            print(f"Error during generation: {exc}")
             return
 
-        print("\n=== Answer ===")
+        print(f"\nPrompt: \"{query}\"\n")
+        print("=== Answer ===")
         print(response)
         print("\n=== Sources ===")
-        for src in sources:
-            print(f"  {src.file_path} "
-                  f"({src.first_character_index}:{src.last_character_index})")
+        for i, src in enumerate(sources):
+            chunk = self.find_chunk(retriever, src)
+            print(f"[{i + 1}] filepath: {src.file_path}")
+            print(f"    chunk:    {i}")
+            print(f"    range:    {src.first_character_index}:"
+                  f"{src.last_character_index}")
+            if chunk:
+                preview = chunk.text[:200].replace("\n", " ")
+                print(f"    text:     {preview}...")
+            print()
 
     def answer_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/answers",
                        skip_generation: bool = False) -> None:
-        """Full RAG pipeline over an entire dataset: retrieve + generate.
-
-        Loads Retriever and Generator once, then processes every question
-        in a single pass. Use skip_generation=True to run retrieval only
-        (useful for measuring recall@k without waiting for the LLM).
+        """Full RAG pipeline over an entire dataset:
+        retrieve + rerank + generate.
 
         Args:
-            dataset_path: Path to a RagDataset JSON (answered or unanswered).
+            dataset_path: Path to a RagDataset JSON.
             k: Chunks to retrieve per question.
             save_directory: Where the output JSON is written.
-            skip_generation: If True, saves SearchResults (no answers).
-                             If False, saves SearchResultsAndAnswer.
+            skip_generation: If True, saves retrieval results only.
+                Useful for measuring recall@k without the LLM.
         """
         if not os.path.isfile(dataset_path):
             print(f"Error: dataset file not found: {dataset_path}")
@@ -247,37 +277,43 @@ class CLI:
         try:
             with open(dataset_path, "r", encoding="utf-8") as fh:
                 dataset = RagDataset.model_validate_json(fh.read())
-        except Exception as e:
-            print(f"Error reading dataset: {e}")
+        except Exception as exc:
+            print(f"Error reading dataset: {exc}")
             return
+
+        use_reranker = not skip_generation
         try:
-            retriever = self._get_retriever()
+            retriever = self.get_retriever(with_reranker=use_reranker)
         except Exception:
             return
 
         generator = None
         if not skip_generation:
             try:
-                generator = self._get_generator()
+                generator = self.get_generator()
             except Exception:
                 return
 
         answers: list[MinimalAnswer] = []
-        search_only: list[MinimalSearchResults] = []
+        search_only: list[MinimalStudentSearchResults] = []
         desc = "Retrieving" if skip_generation else "RAG pipeline"
 
         for question in tqdm(dataset.rag_questions, desc=desc):
-            sources = retriever.search(question.question, k=k)
-
-            if skip_generation or generator is None:
-                search_only.append(MinimalSearchResults(
+            if skip_generation:
+                sources = retriever.search(question.question, k=k)
+                search_only.append(MinimalStudentSearchResults(
                     question_id=question.question_id,
                     question=question.question,
                     retrieved_sources=sources,
                 ))
             else:
+                sources = retriever.search_for_generation(
+                    question.question, k=k
+                )
                 try:
-                    response = generator.answer(question.question, sources)
+                    response = generator.answer(  # type: ignore
+                        question.question, sources
+                    )
                 except Exception:
                     response = "Error generating answer."
                 answers.append(MinimalAnswer(
@@ -289,27 +325,28 @@ class CLI:
 
         filename = os.path.basename(dataset_path)
         if skip_generation:
-            self._save_json(
+            self.save_json(
                 StudentSearchResults(search_results=search_only, k=k),
                 save_directory,
                 filename,
                 label="search_results",
             )
         else:
-            self._save_json(
-                StudentSearchResultsAndAnswer(search_results=answers, k=k),
+            self.save_json(
+                StudentSearchResultsAndAnswer(
+                    search_results=answers, k=k
+                ),
                 save_directory,
                 filename,
                 label="search_results_and_answer",
             )
 
     def evaluate(self, student_answer_path: str, dataset_path: str,
-                 k: int = 10, max_context_length: int = 2000
-                 ) -> None:
+                 k: int = 10, max_context_length: int = 2000) -> None:
         """Evaluate retrieval quality using Recall@k vs ground-truth sources.
 
         Args:
-            student_answer_path: Path to SearchResults JSON.
+            student_answer_path: Path to StudentSearchResults JSON.
             dataset_path: Path to the AnsweredQuestions RagDataset JSON.
             k: Evaluate Recall@1, @3, @5 and @k.
             max_context_length: Kept for moulinette CLI compatibility.
@@ -327,15 +364,35 @@ class CLI:
             metrics = evaluator.compute_recall(
                 student_path=student_answer_path,
                 ground_truth_path=dataset_path,
-                k=k,
-            )
+                k=k)
             evaluator.print_report(metrics)
-        except Exception as e:
-            print(f"Error during evaluation: {e}")
+        except Exception as exc:
+            print(f"Error during evaluation: {exc}")
 
     @staticmethod
-    def _save_json(model: object, directory: str,
-                   filename: str, label: str) -> None:
+    def find_chunk(retriever: object,
+                   source: MinimalSource) -> Optional[object]:
+        """Find the Chunk object matching a MinimalSource.
+
+        Args:
+            retriever: The loaded Retriever instance.
+            source: MinimalSource to look up.
+
+        Returns:
+            Matching Chunk or None if not found.
+        """
+        for chunk in retriever.chunks:
+            if (
+                chunk.file_path == source.file_path
+                and chunk.first_character_index
+                == source.first_character_index
+            ):
+                return chunk
+        return None
+
+    @staticmethod
+    def save_json(model: object, directory: str,
+                  filename: str, label: str) -> None:
         """Serialize a Pydantic model to JSON and write it to disk.
 
         Args:
@@ -347,8 +404,8 @@ class CLI:
         os.makedirs(directory, exist_ok=True)
         out_path = os.path.join(directory, filename)
         try:
-            with open(out_path, "w", encoding="utf-8") as fh:
-                fh.write(model.model_dump_json(indent=2))  # type: ignore[attr-defined]
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(model.model_dump_json(indent=2))
             print(f"Saved {label} to {out_path}")
-        except Exception as e:
-            print(f"Error saving {label}: {e}")
+        except Exception as exc:
+            print(f"Error saving {label}: {exc}")

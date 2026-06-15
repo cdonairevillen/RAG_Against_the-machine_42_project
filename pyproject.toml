@@ -11,7 +11,9 @@ dependencies = [
     "flake8",
     "mypy",
     "llm-sdk",
+    "streamlit",
     "sentence-transformers",
+
 ]
 
 [tool.uv.sources]

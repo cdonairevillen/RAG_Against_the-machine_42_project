@@ -1,12 +1,29 @@
 import ast
 import json
 import os
+import shutil
+from dataclasses import dataclass, field, asdict
+from typing import Generator, Optional
+
 import bm25s
 import numpy as np
-from transformer import SentenceTransformer
-from dataclasses import dataclass, asdict
-from typing import Generator
 from tqdm import tqdm
+
+
+INCLUDE_EXTENSIONS = {".py", ".pyi", ".md", ".rst", ".txt"}
+
+EXCLUDE_DIRS = {
+    "csrc", ".buildkite", ".github", "cmake",
+    "docker", ".gemini", "requirements", "__pycache__",
+    ".git", "node_modules",
+}
+
+CODE_EXTENSIONS = {".py", ".pyi"}
+DOC_EXTENSIONS = {".md", ".rst", ".txt"}
+
+OVERLAP_RATIO = 0.20
+DEFAULT_CODE_CHUNK_SIZE = 1200
+DEFAULT_DOC_CHUNK_SIZE = 2000
 
 
 @dataclass
@@ -14,11 +31,14 @@ class Chunk:
     """A contiguous slice of a source file used as retrieval unit.
 
     Attributes:
-        text: Raw text content of the chunk.
-        file_path: Path to the source file, relative to the repo root.
+        text: Raw text content of the chunk (used for BM25 indexing).
+        file_path: Path relative to the project working directory.
         first_character_index: Inclusive start offset in the original file.
         last_character_index: Exclusive end offset in the original file.
-        chunk_type: One of 'python', 'markdown', 'text'.
+        chunk_type: One of 'code' or 'doc'.
+        symbols: Space-separated AST identifier names extracted from the
+            chunk. Stored separately so they do not affect BM25 length
+            normalization but can be used for query expansion.
     """
 
     text: str
@@ -26,6 +46,7 @@ class Chunk:
     first_character_index: int
     last_character_index: int
     chunk_type: str
+    symbols: str = field(default="")
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict for JSON storage."""
@@ -37,40 +58,14 @@ class Chunk:
         return cls(**data)
 
 
-INCLUDE_EXTENSIONS = {".py", ".md", ".rst"}
-
-EXCLUDE_DIRS = {
-    "csrc", ".buildkite", ".github", "cmake",
-    "docker", ".gemini", "requirements", "__pycache__",
-    ".git", "node_modules",
-}
-
-
-def _should_index(path: str) -> bool:
-    """Return True if this file should be included in the knowledge base.
-
-    Args:
-        path: Relative file path.
-
-    Returns:
-        True when extension is in INCLUDE_EXTENSIONS and no parent dir
-        is in EXCLUDE_DIRS.
-    """
-    _, ext = os.path.splitext(path)
-    if ext not in INCLUDE_EXTENSIONS:
-        return False
-    parts = set(path.replace("\\", "/").split("/"))
-    return not parts.intersection(EXCLUDE_DIRS)
-
-
-def _walk_repo(repo_root: str) -> Generator[str, None, None]:
+def walk_repo(repo_root: str) -> Generator[str, None, None]:
     """Yield absolute paths of all indexable files under repo_root.
 
     Args:
         repo_root: Root directory of the vLLM repository.
 
     Yields:
-        Absolute file paths that pass the _should_index filter.
+        Absolute file paths passing extension and directory filters.
     """
     for dirpath, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = [
@@ -78,30 +73,48 @@ def _walk_repo(repo_root: str) -> Generator[str, None, None]:
             if d not in EXCLUDE_DIRS and not d.startswith(".")
         ]
         for filename in filenames:
+            _, ext = os.path.splitext(filename)
+            if ext not in INCLUDE_EXTENSIONS:
+                continue
             abs_path = os.path.join(dirpath, filename)
-            rel_path = os.path.relpath(abs_path, repo_root)
-            if _should_index(rel_path):
+            rel_parts = set(
+                os.path.relpath(abs_path, repo_root)
+                .replace("\\", "/")
+                .split("/")
+            )
+            if not rel_parts.intersection(EXCLUDE_DIRS):
                 yield abs_path
 
 
-def _split_by_size(text: str, file_path: str, chunk_type: str,
-                   max_chunk_size: int, start_offset: int = 0) -> list[Chunk]:
-    """Split a text block into chunks of at most max_chunk_size chars.
+def split_by_size(
+    text: str,
+    file_path: str,
+    chunk_type: str,
+    max_chunk_size: int,
+    start_offset: int = 0,
+    symbols: str = "",
+) -> list[Chunk]:
+    """Split text into overlapping chunks of at most max_chunk_size chars.
 
-    Breaks on newlines where possible to avoid cutting mid-line.
+    Each chunk overlaps the previous by OVERLAP_RATIO * max_chunk_size
+    characters so that context at chunk boundaries is not lost.
 
     Args:
         text: The text to split.
         file_path: Source file path for metadata.
-        chunk_type: Label for the chunk type.
+        chunk_type: Label for the chunk type ('code' or 'doc').
         max_chunk_size: Maximum characters per chunk.
         start_offset: Character offset of text[0] in the original file.
+        symbols: AST symbol names to store on each produced chunk.
 
     Returns:
-        List of Chunk objects.
+        List of overlapping Chunk objects.
     """
     chunks: list[Chunk] = []
+    overlap = int(max_chunk_size * OVERLAP_RATIO)
+    step = max_chunk_size - overlap
     pos = 0
+
     while pos < len(text):
         end = min(pos + max_chunk_size, len(text))
         if end < len(text):
@@ -115,19 +128,65 @@ def _split_by_size(text: str, file_path: str, chunk_type: str,
                 file_path=file_path,
                 first_character_index=start_offset + pos,
                 last_character_index=start_offset + end,
-                chunk_type=chunk_type))
-        pos = end
+                chunk_type=chunk_type,
+                symbols=symbols,
+            ))
+        pos += step
+
     return chunks
 
 
-def chunk_python_file(file_path: str, content: str,
-                      max_chunk_size: int = 2000) -> list[Chunk]:
+def extract_symbols(node: ast.AST) -> str:
+    """Extract identifier names from an AST node as a space-separated string.
+
+    Collects class names, method names and attribute names defined within
+    the node. These are stored in Chunk.symbols separately from the BM25
+    corpus text so they do not inflate chunk length.
+
+    Args:
+        node: Top-level AST node (FunctionDef, AsyncFunctionDef, ClassDef).
+
+    Returns:
+        Space-separated symbol names, or empty string if none found.
+    """
+    names: list[str] = []
+
+    if isinstance(node, ast.ClassDef):
+        names.append(node.name)
+        for child in ast.walk(node):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                names.append(child.name)
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Name):
+                        names.append(target.id)
+            if isinstance(child, ast.AnnAssign):
+                if isinstance(child.target, ast.Name):
+                    names.append(child.target.id)
+
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        names.append(node.name)
+        for arg in node.args.args:
+            names.append(arg.arg)
+
+    if not names:
+        return ""
+
+    return " ".join(dict.fromkeys(names))
+
+
+def chunk_python_file(
+    file_path: str,
+    content: str,
+    max_chunk_size: int = DEFAULT_CODE_CHUNK_SIZE,
+) -> list[Chunk]:
     """Chunk a Python file using the AST to keep logical units intact.
 
-    Extracts top-level functions and classes as individual chunks.
-    Falls back to size-based splitting for oversized units or unparseable
-    files.
-    Module-level code (imports, constants) becomes a preamble chunk.
+    AST symbol names are stored in Chunk.symbols, not in Chunk.text,
+    so they do not affect BM25 length normalization. The Retriever uses
+    them for query expansion at search time.
 
     Args:
         file_path: Relative path used for chunk metadata.
@@ -135,14 +194,14 @@ def chunk_python_file(file_path: str, content: str,
         max_chunk_size: Maximum characters per chunk.
 
     Returns:
-        List of Chunk objects.
+        List of Chunk objects with symbols metadata.
     """
     chunks: list[Chunk] = []
 
     try:
         tree = ast.parse(content)
     except SyntaxError:
-        return _split_by_size(content, file_path, "python", max_chunk_size)
+        return split_by_size(content, file_path, "code", max_chunk_size)
 
     lines = content.splitlines(keepends=True)
     line_offsets: list[int] = []
@@ -173,6 +232,7 @@ def chunk_python_file(file_path: str, content: str,
 
         first, last = node_char_range(node)
         node_text = content[first:last]
+        symbols = extract_symbols(node)
         covered.append((first, last))
 
         if len(node_text) <= max_chunk_size:
@@ -181,12 +241,15 @@ def chunk_python_file(file_path: str, content: str,
                 file_path=file_path,
                 first_character_index=first,
                 last_character_index=last,
-                chunk_type="python",
+                chunk_type="code",
+                symbols=symbols,
             ))
         else:
             chunks.extend(
-                _split_by_size(node_text, file_path, "python", max_chunk_size,
-                               first)
+                split_by_size(
+                    node_text, file_path, "code",
+                    max_chunk_size, first, symbols,
+                )
             )
 
     covered_sorted = sorted(covered)
@@ -206,18 +269,16 @@ def chunk_python_file(file_path: str, content: str,
     preamble = "\n\n".join(preamble_parts).strip()
     if preamble:
         chunks.extend(
-            _split_by_size(preamble, file_path, "python", max_chunk_size)
+            split_by_size(preamble, file_path, "code", max_chunk_size)
         )
 
     return chunks
 
 
-def chunk_markdown_file(file_path: str, content: str,
-                        max_chunk_size: int = 2000) -> list[Chunk]:
+def chunk_doc_file(file_path: str, content: str,
+                   max_chunk_size: int = DEFAULT_DOC_CHUNK_SIZE
+                   ) -> list[Chunk]:
     """Chunk a Markdown or RST file by splitting on header lines.
-
-    Each section (header to next header) becomes one chunk.
-    Oversized sections are split further by _split_by_size.
 
     Args:
         file_path: Relative path used for chunk metadata.
@@ -234,70 +295,74 @@ def chunk_markdown_file(file_path: str, content: str,
     section_start_offset = 0
     char_offset = 0
 
+    def flush(end_offset: int) -> None:
+        section_text = "".join(section_lines).strip()
+        if not section_text:
+            return
+        if len(section_text) <= max_chunk_size:
+            chunks.append(Chunk(
+                text=section_text,
+                file_path=file_path,
+                first_character_index=section_start_offset,
+                last_character_index=end_offset,
+                chunk_type="doc",
+            ))
+        else:
+            chunks.extend(split_by_size(
+                section_text, file_path, "doc",
+                max_chunk_size, section_start_offset,
+            ))
+
     for line in lines:
-        is_header = line.startswith("#")
-        if is_header and section_lines:
-            section_text = "".join(section_lines).strip()
-            if section_text:
-                if len(section_text) <= max_chunk_size:
-                    chunks.append(Chunk(
-                        text=section_text,
-                        file_path=file_path,
-                        first_character_index=section_start_offset,
-                        last_character_index=char_offset,
-                        chunk_type="markdown",
-                    ))
-                else:
-                    chunks.extend(_split_by_size(
-                        section_text, file_path, "markdown",
-                        max_chunk_size, section_start_offset,
-                    ))
+        if line.startswith("#") and section_lines:
+            flush(char_offset)
             section_lines = []
             section_start_offset = char_offset
-
         section_lines.append(line)
         char_offset += len(line)
 
-    if section_lines:
-        section_text = "".join(section_lines).strip()
-        if section_text:
-            if len(section_text) <= max_chunk_size:
-                chunks.append(Chunk(
-                    text=section_text,
-                    file_path=file_path,
-                    first_character_index=section_start_offset,
-                    last_character_index=char_offset,
-                    chunk_type="markdown",
-                ))
-            else:
-                chunks.extend(_split_by_size(
-                    section_text, file_path, "markdown",
-                    max_chunk_size, section_start_offset,
-                ))
-
+    flush(char_offset)
     return chunks
 
 
+def chunk_text_file(file_path: str, content: str,
+                    max_chunk_size: int = DEFAULT_DOC_CHUNK_SIZE
+                    ) -> list[Chunk]:
+    """Fallback chunker for plain text and unrecognised readable file types.
+
+    Args:
+        file_path: Relative path used for chunk metadata.
+        content: Full text content of the file.
+        max_chunk_size: Maximum characters per chunk.
+
+    Returns:
+        List of Chunk objects with overlap.
+    """
+    return split_by_size(content, file_path, "doc", max_chunk_size)
+
+
 class Ingester:
-    """Reads the vLLM repository, chunks it, and builds a BM25 index.
+    """Reads the vLLM repository, chunks it, and builds a unified BM25 index.
+
+    Uses different chunk sizes for code (1200) and docs (2000) to improve
+    term density in code chunks without sacrificing doc context coverage.
+    AST symbol names are stored in Chunk.symbols separately from the BM25
+    corpus to avoid penalising chunks via length normalization.
 
     Usage:
-        ingester = Ingester(repo_root="data/raw/vllm-0.10.1",
-        max_chunk_size=2000)
+        ingester = Ingester(repo_root="data/raw/vllm-0.10.1")
         ingester.build()
         ingester.save("data/processed")
 
-        # Reload without re-indexing:
         ingester = Ingester.load("data/processed")
 
     Attributes:
         repo_root: Path to the root of the vLLM repository.
-        max_chunk_size: Maximum characters per chunk.
+        code_chunk_size: Maximum characters per code chunk.
+        doc_chunk_size: Maximum characters per doc chunk.
         chunks: All Chunk objects produced by build().
-        retriever: Fitted bm25s.BM25 instance produced by build().
-
-    EMBEDDINGS:
-        
+        bm25: Fitted unified BM25 instance.
+        embeddings: Dense vectors for all chunks, or None.
     """
 
     CHUNKS_FILE = "chunks.json"
@@ -305,51 +370,69 @@ class Ingester:
     EMBEDDINGS_FILE = "embeddings.npy"
     EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-    def __init__(self, repo_root: str, max_chunk_size: int = 2000) -> None:
-        """Initialize the Ingester.
+    def __init__(self, repo_root: str,
+                 code_chunk_size: int = DEFAULT_CODE_CHUNK_SIZE,
+                 doc_chunk_size: int = DEFAULT_DOC_CHUNK_SIZE) -> None:
+        """Initialise the Ingester.
 
         Args:
             repo_root: Path to the vLLM repository root directory.
-            max_chunk_size: Maximum number of characters per chunk.
+            code_chunk_size: Maximum characters per code chunk.
+            doc_chunk_size: Maximum characters per doc chunk.
         """
         self.repo_root = repo_root
-        self.max_chunk_size = max_chunk_size
+        self.code_chunk_size = code_chunk_size
+        self.doc_chunk_size = doc_chunk_size
         self.chunks: list[Chunk] = []
-        self.retriever: bm25s.BM25 | None = None
-        self.embeddings: np.ndarray | None = None
+        self.bm25: Optional[bm25s.BM25] = None
+        self.embeddings: Optional[np.ndarray] = None
 
     def build(self, use_embeddings: bool = True) -> None:
-        """Ingest the repository: chunk all files and fit the BM25 index."""
-        self.chunks = self._collect_chunks()
-        self.retriever = self._build_bm25(self.chunks)
-        if use_embeddings:
-            self.embeddings = self._build_embeddings(self.chunks)
-
-    def save(self, output_dir: str) -> None:
-        """Persist chunks and BM25 index to disk.
+        """Ingest the repository and fit the BM25 index.
 
         Args:
-            output_dir: Directory where artefacts will be written.
+            use_embeddings: When True, also encodes all chunks with
+                sentence-transformers for semantic search.
+        """
+        self.chunks = self.collect_chunks()
+        self.bm25 = self.build_bm25(self.chunks)
+        if use_embeddings:
+            self.embeddings = self.build_embeddings(self.chunks)
+
+    def save(self, output_dir: str) -> None:
+        """Persist all artefacts to disk.
+
+        Args:
+            output_dir: Root directory for all output artefacts.
 
         Raises:
-            RuntimeError: If build() has not been called yet.
+            RuntimeError: If build() has not been called.
         """
-        if not self.chunks or self.retriever is None:
+        if not self.chunks or self.bm25 is None:
             raise RuntimeError("Call build() before save().")
 
+        if os.path.isdir(output_dir):
+            shutil.rmtree(output_dir)
         chunks_dir = os.path.join(output_dir, "chunks")
-        index_dir = os.path.join(output_dir, self.INDEX_DIR)
         os.makedirs(chunks_dir, exist_ok=True)
+
+        with open(
+            os.path.join(chunks_dir, self.CHUNKS_FILE), "w", encoding="utf-8"
+        ) as fh:
+            json.dump(
+                [c.to_dict() for c in self.chunks], fh, ensure_ascii=False
+            )
+
+        index_dir = os.path.join(output_dir, self.INDEX_DIR)
         os.makedirs(index_dir, exist_ok=True)
+        self.bm25.save(index_dir)
 
-        chunks_path = os.path.join(chunks_dir, self.CHUNKS_FILE)
-        with open(chunks_path, "w", encoding="utf-8") as fh:
-            json.dump([c.to_dict() for c in self.chunks], fh,
-                      ensure_ascii=False)
-
-        self.retriever.save(index_dir)
-        print(f"Saved {len(self.chunks)} chunks → {chunks_dir}")
-        print(f"Saved BM25 index → {index_dir}")
+        doc_count = sum(1 for c in self.chunks if c.chunk_type == "doc")
+        code_count = sum(1 for c in self.chunks if c.chunk_type == "code")
+        print(
+            f"Saved {len(self.chunks)} chunks "
+            f"({doc_count} doc, {code_count} code)"
+        )
 
         if self.embeddings is not None:
             embed_path = os.path.join(output_dir, self.EMBEDDINGS_FILE)
@@ -364,32 +447,54 @@ class Ingester:
             processed_dir: Directory produced by save().
 
         Returns:
-            Ingester with chunks and retriever populated.
+            Ingester instance ready for use by the Retriever.
         """
         ingester = cls.__new__(cls)
         ingester.repo_root = ""
-        ingester.max_chunk_size = 2000
+        ingester.code_chunk_size = DEFAULT_CODE_CHUNK_SIZE
+        ingester.doc_chunk_size = DEFAULT_DOC_CHUNK_SIZE
 
-        chunks_path = os.path.join(processed_dir, "chunks", cls.CHUNKS_FILE)
-        with open(chunks_path, "r", encoding="utf-8") as fh:
+        chunks_dir = os.path.join(processed_dir, "chunks")
+        with open(
+            os.path.join(chunks_dir, cls.CHUNKS_FILE), "r", encoding="utf-8"
+        ) as fh:
             ingester.chunks = [Chunk.from_dict(d) for d in json.load(fh)]
 
         index_dir = os.path.join(processed_dir, cls.INDEX_DIR)
-        ingester.retriever = bm25s.BM25.load(index_dir, load_corpus=False)
+        ingester.bm25 = bm25s.BM25.load(index_dir, load_corpus=False)
 
-        print(f"Loaded {len(ingester.chunks)} chunks from {processed_dir}")
+        embed_path = os.path.join(processed_dir, cls.EMBEDDINGS_FILE)
+        if os.path.isfile(embed_path):
+            ingester.embeddings = np.load(embed_path)
+            print(f"Loaded embeddings {ingester.embeddings.shape}")
+        else:
+            ingester.embeddings = None
+
+        doc_count = sum(1 for c in ingester.chunks if c.chunk_type == "doc")
+        code_count = sum(
+            1 for c in ingester.chunks if c.chunk_type == "code"
+        )
+        print(
+            f"Loaded {len(ingester.chunks)} chunks "
+            f"({doc_count} doc, {code_count} code)"
+        )
         return ingester
 
-    def _collect_chunks(self) -> list[Chunk]:
-        """Walk the repository and produce all chunks."""
+    def collect_chunks(self) -> list[Chunk]:
+        """Walk the repository and produce all chunks.
+
+        Returns:
+            Flat list of Chunk objects from all indexed files.
+        """
         all_chunks: list[Chunk] = []
-        files = list(_walk_repo(self.repo_root))
+        files = list(walk_repo(self.repo_root))
 
         for abs_path in tqdm(files, desc="Chunking files"):
-            rel_path = os.path.relpath(abs_path)  # relativo al CWD del proyecto (revisar)
+            rel_path = os.path.relpath(abs_path).replace("\\", "/")
             try:
-                with (open(abs_path, "r", encoding="utf-8", errors="ignore")
-                      as fh):
+                with open(
+                    abs_path, "r", encoding="utf-8", errors="ignore"
+                ) as fh:
                     content = fh.read()
             except OSError:
                 continue
@@ -398,38 +503,70 @@ class Ingester:
                 continue
 
             _, ext = os.path.splitext(abs_path)
-            if ext == ".py":
+            if ext in CODE_EXTENSIONS:
                 file_chunks = chunk_python_file(
-                    rel_path, content, self.max_chunk_size
+                    rel_path, content, self.code_chunk_size
+                )
+            elif ext in DOC_EXTENSIONS:
+                file_chunks = chunk_doc_file(
+                    rel_path, content, self.doc_chunk_size
                 )
             else:
-                file_chunks = chunk_markdown_file(
-                    rel_path, content, self.max_chunk_size
+                file_chunks = chunk_text_file(
+                    rel_path, content, self.doc_chunk_size
                 )
 
             all_chunks.extend(file_chunks)
 
         return all_chunks
 
-    def _build_bm25(self, chunks: list[Chunk]) -> bm25s.BM25:
-        """Tokenize chunks and fit the BM25 model.
+    def build_bm25(
+        self, chunks: list[Chunk], label: str = "corpus"
+    ) -> bm25s.BM25:
+        """Tokenize all chunks and fit a unified BM25 model.
+
+        Only Chunk.text is used — Chunk.symbols is excluded from the
+        corpus to avoid penalising chunks via BM25 length normalization.
 
         Args:
-            chunks: List of Chunk objects to index.
+            chunks: All Chunk objects to index.
+            label: Human-readable label for progress output.
 
         Returns:
             A fitted bm25s.BM25 instance.
         """
         corpus = [c.text for c in chunks]
-        print("Tokenizing corpus...")
-        tokenized = bm25s.tokenize(corpus, stopwords="en", show_progress=True)
-        print("Fitting BM25...")
+        print(f"Tokenizing {label} ({len(corpus)} chunks)...")
+        tokenized = bm25s.tokenize(
+            corpus, stopwords="en", show_progress=True
+        )
         retriever = bm25s.BM25()
         retriever.index(tokenized, show_progress=True)
         return retriever
 
-    def _build_embeddings(self, chunks: list[Chunk]) -> np.ndarray:
+    def build_embeddings(self, chunks: list[Chunk]) -> np.ndarray:
+        """Encode all chunks into dense embedding vectors.
+
+        Uses all-MiniLM-L6-v2 (80 MB, 384 dimensions).
+        Vectors are L2-normalised so cosine similarity equals dot product.
+
+        Args:
+            chunks: All Chunk objects to encode.
+
+        Returns:
+            numpy array of shape (n_chunks, 384), dtype float32.
+        """
+        from sentence_transformers import SentenceTransformer
+
+        print(f"Loading embedding model {self.EMBED_MODEL}...")
         model = SentenceTransformer(self.EMBED_MODEL)
         texts = [c.text for c in chunks]
-        embeddings = model.encode(texts, normalice_embeddings=True)
+        print(f"Encoding {len(texts)} chunks...")
+        embeddings: np.ndarray = model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
         return embeddings

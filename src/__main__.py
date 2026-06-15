@@ -1,5 +1,5 @@
-from src.cli import CLI
 import fire
+from src.cli import CLI
 
 
 def main() -> None:

@@ -3,43 +3,23 @@ from llm_sdk import Small_LLM_Model
 from src.models import MinimalSource
 
 
-SYSTEM_PROMPT = """You are a precise technical assistant for the vLLM codebase.
-Answer ONLY using the context provided below.
-Do NOT use prior knowledge or make assumptions beyond what the context states.
-If the answer is not present in the context, respond with: "Not found in the
-provided sources."
-Keep your answer concise, self-contained, and cite the source file(s) you
-used."""
-
-
-def _build_prompt(question: str, context_blocks: list[str]) -> str:
-    """Assemble the full prompt fed to the LLM.
-
-    Structure:
-        [SYSTEM]
-        CONTEXT:
-        --- file: path ---
-        chunk text
-        ...
-        QUESTION: ...
-        ANSWER:
-
-    The trailing 'ANSWER:' token primes the model to generate a response
-    directly, reducing preamble like "Sure, I can help you with that...".
-
-    Args:
-        question: The user's natural-language question.
-        context_blocks: List of formatted context strings (one per chunk).
-
-    Returns:
-        Full prompt string ready for tokenization.
-    """
+def build_prompt(question: str, context_blocks: list[str]) -> str:
+    """Assemble prompt using Qwen3 chat format with thinking disabled."""
     context_section = "\n\n".join(context_blocks)
+    system = (
+        "You are a precise technical assistant for the vLLM codebase. "
+        "Answer ONLY using the context provided. "
+        "Be concise and cite the source file(s) you used. "
+        "If the answer is not in the context, say: "
+        "'Not found in the provided sources.'"
+    )
+    user_content = (
+        f"CONTEXT:\n{context_section}\n\nQUESTION: {question} /no_think"
+    )
     return (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"CONTEXT:\n{context_section}\n\n"
-        f"QUESTION: {question}\n\n"
-        f"ANSWER:"
+        f"<|im_start|>system\n{system}<|im_end|>\n"
+        f"<|im_start|>user\n{user_content}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
     )
 
 
@@ -47,35 +27,34 @@ class Generator:
     """Loads Qwen/Qwen3-0.6B and generates grounded answers via greedy
     decoding.
 
-    Greedy decoding: at each step, pick the token with the highest logit.
-    This is deterministic and avoids hallucination drift from sampling.
+    Greedy decoding picks the highest-logit token at each step, making
+    generation deterministic and faithful to the retrieved context.
 
-    The model is loaded once at construction and reused for all calls,
-    which is why Generator should be instantiated once and shared
-    (e.g. via the Pipeline class).
+    The model is loaded once at construction and reused for all calls.
+    Instantiate once and share via the CLI lazy loader.
 
     Usage:
         generator = Generator()
-        answer = generator.answer("How does PagedAttention work?", sources)
+        answer = generator.answer(
+            "How does PagedAttention work?", sources
+        )
 
     Attributes:
         model: Loaded Small_LLM_Model instance.
         max_new_tokens: Maximum tokens to generate per answer.
-        repo_root: Used to resolve file paths when reading chunk content.
+        repo_root: Used to read chunk text from disk.
     """
 
     MODEL_NAME = "Qwen/Qwen3-0.6B"
 
-    def __init__(self,
-                 max_new_tokens: int = 150,
+    def __init__(self, max_new_tokens: int = 150,
                  repo_root: str = "data/raw/vllm-0.10.1") -> None:
-        """Load the LLM. This is the slow step (~30-60s on first run).
+        """Load the LLM. First run downloads weights (~600 MB).
 
         Args:
-            max_new_tokens: Maximum tokens generated per answer.
-                Keep low (100-200) — greedy decoding has no KV-cache,
-                so each token costs a full forward pass.
-            repo_root: Root of the vLLM repo, used to read chunk text.
+            max_new_tokens: Cap on generated tokens per answer.
+                Keep low (100-200) — each token costs a full forward pass.
+            repo_root: Root of the vLLM repo for reading chunk text.
         """
         print(f"Loading {self.MODEL_NAME}...")
         self.model = Small_LLM_Model(model_name=self.MODEL_NAME)
@@ -98,14 +77,16 @@ class Generator:
         if not sources:
             return "No relevant sources found."
 
-        context_blocks = self._build_context_blocks(sources)
-        prompt = _build_prompt(question, context_blocks)
-        prompt = self._truncate_prompt(prompt)
-        return self._greedy_decode(prompt)
+        context_blocks = self.build_context_blocks(sources)
+        if not context_blocks:
+            return "Could not read source content from disk."
+
+        prompt = build_prompt(question, context_blocks)
+        prompt = self.truncate_prompt(prompt)
+        return self.greedy_decode(prompt)
 
     def answer_batch(self, questions: list[str],
-                     sources_list: list[list[MinimalSource]]
-                     ) -> list[str]:
+                     sources_list: list[list[MinimalSource]]) -> list[str]:
         """Generate answers for multiple questions.
 
         Args:
@@ -113,7 +94,7 @@ class Generator:
             sources_list: Parallel list of retrieved sources per question.
 
         Returns:
-            List of answer strings, same order as input.
+            List of answer strings in the same order as input.
         """
         answers: list[str] = []
         for question, sources in zip(questions, sources_list):
@@ -123,8 +104,7 @@ class Generator:
                 answers.append("Error generating answer.")
         return answers
 
-    def _build_context_blocks(self,
-                              sources: list[MinimalSource]) -> list[str]:
+    def build_context_blocks(self, sources: list[MinimalSource]) -> list[str]:
         """Read the actual text for each source from disk and format it.
 
         Args:
@@ -135,13 +115,12 @@ class Generator:
         """
         blocks: list[str] = []
         for source in sources:
-            text = self._read_chunk_text(source)
+            text = self.read_chunk_text(source)
             if text:
-                block = f"--- file: {source.file_path} ---\n{text}"
-                blocks.append(block)
+                blocks.append(f"--- file: {source.file_path} ---\n{text}")
         return blocks
 
-    def _read_chunk_text(self, source: MinimalSource) -> str:
+    def read_chunk_text(self, source: MinimalSource) -> str:
         """Extract the exact text slice from the source file on disk.
 
         Args:
@@ -151,20 +130,24 @@ class Generator:
             The text slice, or empty string if the file cannot be read.
         """
         abs_path = os.path.join(self.repo_root, source.file_path)
+        if not os.path.isfile(abs_path):
+            abs_path = source.file_path
         try:
-            with open(abs_path, "r", encoding="utf-8", errors="ignore") as fh:
+            with open(
+                abs_path, "r", encoding="utf-8", errors="ignore"
+            ) as fh:
                 content = fh.read()
-            return content[source.first_character_index:source.last_character_index]
+            return content[
+                source.first_character_index:source.last_character_index
+            ]
         except (OSError, IndexError):
             return ""
 
-    def _truncate_prompt(self, prompt: str, max_chars: int = 3000) -> str:
-        """Truncate the prompt to stay within the model's context window.
+    def truncate_prompt(self, prompt: str, max_chars: int = 3000) -> str:
+        """Truncate the prompt to stay within a reasonable token budget.
 
-        Qwen3-0.6B has a 32k token context, but with greedy decoding
-        (no KV-cache) longer prompts are proportionally slower.
-        We keep the system prompt and question intact, truncating only
-        the middle context section.
+        Keeps the system prompt and question intact; truncates only the
+        middle context section so the model always sees the full question.
 
         Args:
             prompt: Full assembled prompt.
@@ -183,37 +166,39 @@ class Generator:
         budget = max_chars - len(tail)
         return prompt[:budget] + "\n[context truncated]\n" + tail
 
-    def _greedy_decode(self, prompt: str) -> str:
-        """Generate text token by token using argmax (greedy) decoding.
-
-        This is the only generation strategy available through the SDK's
-        public interface (get_logits_from_input_ids).
-
-        Each iteration:
-          1. Tokenize the current sequence.
-          2. Run a forward pass → get logits for the next token position.
-          3. Pick the token with the highest logit (argmax).
-          4. Append it and repeat.
-          5. Stop at EOS or max_new_tokens.
+    def greedy_decode(self, prompt: str) -> str:
+        """Generate text using HuggingFace's native generate() with KV-cache.
 
         Args:
             prompt: The full prompt string to continue from.
 
         Returns:
-            Generated text (new tokens only, not including the prompt).
+            Generated text (new tokens only, prompt excluded).
         """
-        input_ids: list[int] = self.model.encode(prompt)[0].tolist()
-        prompt_length = len(input_ids)
-        eos_id: int = self.model._tokenizer.eos_token_id
+        import re
+        import torch
 
-        for _ in range(self.max_new_tokens):
-            logits = self.model.get_logits_from_input_ids(input_ids)
-            next_token = int(max(range(len(logits)), key=lambda i: logits[i]))
+        inputs = self.model._tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+        ).to(self.model._device)
 
-            if next_token == eos_id:
-                break
+        eos_token = self.model._tokenizer.encode("<|im_end|>")[0]
 
-            input_ids.append(next_token)
+        with torch.no_grad():
+            output_ids = self.model._model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.model._tokenizer.eos_token_id,
+                eos_token_id=eos_token,
+            )
 
-        new_ids = input_ids[prompt_length:]
-        return self.model.decode(new_ids).strip()
+        new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
+        text = self.model.decode(new_ids).strip()
+
+        # Strip thinking block
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        return text.strip()
