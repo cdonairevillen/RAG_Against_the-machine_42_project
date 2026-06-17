@@ -206,6 +206,10 @@ class Retriever:
         Returns:
             Reranked list of MinimalSource objects, best match first.
         """
+
+        if self.get_top_bm25_score(query) < 4.5:
+            return []
+
         if not query or not query.strip() or k <= 0:
             return []
 
@@ -369,9 +373,6 @@ class Retriever:
         Returns:
             Ranked MinimalSource list.
         """
-        top_scores = self.get_top_bm25_score(query)
-        if top_scores < 1.0:
-            return []
 
         fetch_k = min(k * 2, len(self.chunks))
         rrf_scores: dict[int, float] = {}

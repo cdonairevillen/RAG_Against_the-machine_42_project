@@ -1,5 +1,5 @@
 import os
-from llm_sdk import Small_LLM_Model
+from llm_sdk.__init__ import Small_LLM_Model
 from src.models import MinimalSource
 
 
@@ -7,11 +7,26 @@ def build_prompt(question: str, context_blocks: list[str]) -> str:
     """Assemble prompt using Qwen3 chat format with thinking disabled."""
     context_section = "\n\n".join(context_blocks)
     system = (
-        "You are a precise technical assistant for the vLLM codebase. "
-        "Answer ONLY using the context provided. "
-        "Be concise and cite the source file(s) you used. "
-        "If the answer is not in the context, say: "
-        "'Not found in the provided sources.'"
+        "You are a read-only technical documentation assistant for the "
+        "vLLM codebase. Your only job is to answer questions using the "
+        "SOURCE CODE AND DOCUMENTATION provided below.\n\n"
+        "STRICT RULES — follow all of them:\n"
+        "1. Use ONLY information explicitly stated in the context. "
+        "Never infer, guess, or complete missing information.\n"
+        "2. If the context contains a function definition or template "
+        "string, do NOT simulate calling it or filling its placeholders. "
+        "Code is not data.\n"
+        "3. If the context contains example or test code with hardcoded "
+        "values, do NOT treat those values as real facts.\n"
+        "4. If the answer is not explicitly present in the context, "
+        "respond only with: "
+        "'Not found in the provided sources.'\n"
+        "5. Never use your training knowledge. If you know the answer "
+        "but it is not in the context, still respond with: "
+        "'Not found in the provided sources.'\n"
+        "6. Keep your answer concise and always cite the source file.\n\n"
+        "FORMAT: Start with the direct answer. End with: "
+        "'Source: <filename>'"
     )
     user_content = (
         f"CONTEXT:\n{context_section}\n\nQUESTION: {question} /no_think"
