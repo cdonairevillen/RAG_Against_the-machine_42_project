@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import Optional, Any
 import bm25s
 import numpy as np
 from tqdm import tqdm
@@ -434,7 +434,7 @@ class Retriever:
         )
         return [source for _, source in ranked[:k]]
 
-    def retrieve_from_bm25(self, query: str, k: int) -> list[int]:
+    def retrieve_from_bm25(self, query: str, k: int) -> Any | list[int]:
         """Run a BM25 query and return chunk indices.
 
         Args:

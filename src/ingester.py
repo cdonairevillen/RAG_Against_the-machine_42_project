@@ -378,7 +378,6 @@ class Ingester:
         self.doc_chunk_size = doc_chunk_size
         self.chunks: list[Chunk] = []
         self.bm25: Optional[bm25s.BM25] = None
-        self.bm25_docs: Optional[bm25s.BM25] = None
         self.bm25_code: Optional[bm25s.BM25] = None
         self.doc_indices: list[int] = []
         self.code_indices: list[int] = []
@@ -439,7 +438,9 @@ class Ingester:
         code_dir = os.path.join(output_dir, "bm25_code")
         os.makedirs(docs_dir, exist_ok=True)
         os.makedirs(code_dir, exist_ok=True)
+        assert self.bm25_docs is not None
         self.bm25_docs.save(docs_dir)
+        assert self.bm25_code is not None
         self.bm25_code.save(code_dir)
 
         meta_path = os.path.join(output_dir, "meta.json")

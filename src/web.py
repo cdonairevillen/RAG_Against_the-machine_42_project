@@ -1,6 +1,7 @@
 import os
 import sys
 import streamlit as st
+from streamlit.deltagenerator import DeltaGenerator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -307,7 +308,7 @@ def load_recall_metrics() -> dict:
 
 
 def render_recall_bars(recall: dict, label: str,
-                       col: object) -> None:
+                       col: DeltaGenerator) -> None:
     """Render a set of Recall@k bars in a Streamlit column.
 
     Args:
@@ -413,11 +414,11 @@ def main() -> None:
             unsafe_allow_html=True
         )
         embed_active = (
-            retriever.embeddings is not None  # type: ignore
-            and retriever.embed_model is not None  # type: ignore
+            retriever.embeddings is not None
+            and retriever.embed_model is not None
         )
-        reranker_active = retriever.reranker is not None  # type: ignore
-        n_chunks = len(retriever.chunks)  # type: ignore
+        reranker_active = retriever.reranker is not None
+        n_chunks = len(retriever.chunks)
 
         st.markdown(f"""
 <div class="metric-card">
@@ -464,7 +465,7 @@ def main() -> None:
         if run and query and query.strip():
             # Retrieve
             with st.spinner("Retrieving relevant chunks..."):
-                sources = retriever.search_for_generation(  # type: ignore
+                sources = retriever.search_for_generation(
                     query, k=k_val
                 )
 
@@ -478,7 +479,7 @@ def main() -> None:
             else:
                 # Generate
                 with st.spinner("Generating answer..."):
-                    answer = generator.answer(query, sources)  # type: ignore
+                    answer = generator.answer(query, sources)
 
                 if not answer or answer.strip() in (
                     "No question provided.",

@@ -1,7 +1,8 @@
 from src.retriever import Retriever
 from src.generator import Generator
+from src.ingester import Chunk
+from pydantic import BaseModel
 import os
-from typing import Optional
 from tqdm import tqdm
 from src.models import (MinimalAnswer,
                         MinimalSearchResults,
@@ -63,8 +64,8 @@ class CLI:
         """
         self.processed_dir = processed_dir
         self.repo_root = repo_root
-        self.retriever: Optional[object] = None
-        self.generator: Optional[object] = None
+        self.retriever: Retriever | None = None
+        self.generator: Generator | None = None
 
     def get_retriever(self, with_reranker: bool = False) -> Retriever:
         """Load and cache the Retriever.
@@ -263,7 +264,7 @@ class CLI:
 
     def answer_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/answers",
-                       skip_generation: bool = False) -> None:
+                       skip_generation: bool = True) -> None:
         """Full RAG pipeline over an entire dataset:
         retrieve + rerank + generate.
 
@@ -373,8 +374,8 @@ class CLI:
             print(f"Error during evaluation: {exc}")
 
     @staticmethod
-    def find_chunk(retriever: object,
-                   source: MinimalSource) -> Optional[object]:
+    def find_chunk(retriever: Retriever,
+                   source: MinimalSource) -> Chunk | None:
         """Find the Chunk object matching a MinimalSource.
 
         Args:
@@ -394,7 +395,7 @@ class CLI:
         return None
 
     @staticmethod
-    def save_json(model: object, directory: str,
+    def save_json(model: BaseModel, directory: str,
                   filename: str, label: str) -> None:
         """Serialize a Pydantic model to JSON and write it to disk.
 
