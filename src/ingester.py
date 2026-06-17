@@ -7,6 +7,7 @@ from typing import Generator, Optional
 import bm25s
 import numpy as np
 from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
 
 
 INCLUDE_EXTENSIONS = {".py", ".pyi", ".md", ".rst", ".txt"}
@@ -596,7 +597,6 @@ class Ingester:
         Returns:
             numpy array of shape (n_chunks, 384), dtype float32.
         """
-        from sentence_transformers import SentenceTransformer
 
         print(f"Loading embedding model {self.EMBED_MODEL}...")
         model = SentenceTransformer(self.EMBED_MODEL)

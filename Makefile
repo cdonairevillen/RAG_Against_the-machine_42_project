@@ -58,11 +58,11 @@ web-stop:
 
 index:
 	$(ENV) $(UV) run --project . $(PY) -m src index \
-		--code_chunk_size 1200 --doc_chunk_size 2000 --use_embeddings True
-
-index-fast:
-	$(ENV) $(UV) run --project . $(PY) -m src index \
 		--code_chunk_size 1200 --doc_chunk_size 2000 --use_embeddings False
+
+index-embed:
+	$(ENV) $(UV) run --project . $(PY) -m src index \
+		--code_chunk_size 1200 --doc_chunk_size 2000 --use_embeddings True
 
 search-docs:
 	$(ENV) $(UV) run --project . $(PY) -m src answer_dataset \
@@ -89,7 +89,7 @@ eval-code:
 		--k 10
 
 lint:
-	$(ENV) $(UV) run --project . flake8 src --max-line-length 84
+	$(ENV) $(UV) run --project . flake8 src
 	$(ENV) $(UV) run --project . mypy src \
 		--warn-return-any \
 		--warn-unused-ignores \
@@ -108,7 +108,7 @@ clean:
 
 meme:
 	@echo "Killing in the name of... bad retrieval scores"
-	@xdg-open "https://www.youtube.com/watch?v=bWXazVhlyxQ" 2>/dev/null || true
+	@xdg-open "https://www.youtube.com/watch?v=bWXazVhlyxQ" 2>/dev/null & true
 	@echo "https://www.youtube.com/watch?v=bWXazVhlyxQ"
 	$(ENV) $(UV) run streamlit run src/web.py &
 	@echo "Web running at http://localhost:8501"

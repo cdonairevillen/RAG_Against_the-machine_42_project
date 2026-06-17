@@ -381,13 +381,6 @@ def main() -> None:
         with st.spinner("Loading retriever and reranker..."):
             try:
                 st.session_state.retriever = load_retriever()
-                # DEBUG TEMPORAL
-                r = st.session_state.retriever
-                st.write(f"Chunks: {len(r.chunks)}")
-                st.write(f"Embeddings: {r.embeddings is not None}")
-                st.write(f"Embed model: {r.embed_model is not None}")
-                st.write(f"bm25_docs: {r.bm25_docs is not None}")
-                st.write(f"bm25_code: {r.bm25_code is not None}")
             except Exception as exc:
                 st.error(
                     f"Could not load index: {exc}\n\n"

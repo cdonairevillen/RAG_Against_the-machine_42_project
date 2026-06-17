@@ -1,4 +1,6 @@
 import os
+import re
+import torch
 from llm_sdk.__init__ import Small_LLM_Model
 from src.models import MinimalSource
 
@@ -26,7 +28,9 @@ def build_prompt(question: str, context_blocks: list[str]) -> str:
         "'Not found in the provided sources.'\n"
         "6. Keep your answer concise. If you found the answer, always "
         "cite the source file at the end.\n\n"
-        "FORMAT when answer IS found: direct answer + 'Source: <filename>'\n"
+        "FORMAT when answer IS found: direct answer + 'Source: <filenames>' "
+        "<filenames> will be filled with all the files where your answer comes"
+        " from\n"
         "FORMAT when answer IS NOT found: 'Not found in the provided sources.'"
         "BEFORE ANSWERING, verify: does the context explicitly contain "
         "the answer to the question? If NO, respond ONLY with: "
@@ -195,8 +199,6 @@ class Generator:
         Returns:
             Generated text (new tokens only, prompt excluded).
         """
-        import re
-        import torch
 
         inputs = self.model._tokenizer(
             prompt,

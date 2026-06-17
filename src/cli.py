@@ -255,7 +255,7 @@ class CLI:
                 print(f"[{i + 1}] filepath: {src.file_path}")
                 print(f"    chunk:    {i}")
                 print(f"    range:    {src.first_character_index}:"
-                    f"{src.last_character_index}")
+                      f"{src.last_character_index}")
                 if chunk:
                     preview = chunk.text[:200].replace("\n", " ")
                     print(f"    text:     {preview}...")
