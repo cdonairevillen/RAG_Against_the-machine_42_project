@@ -381,6 +381,13 @@ def main() -> None:
         with st.spinner("Loading retriever and reranker..."):
             try:
                 st.session_state.retriever = load_retriever()
+                # DEBUG TEMPORAL
+                r = st.session_state.retriever
+                st.write(f"Chunks: {len(r.chunks)}")
+                st.write(f"Embeddings: {r.embeddings is not None}")
+                st.write(f"Embed model: {r.embed_model is not None}")
+                st.write(f"bm25_docs: {r.bm25_docs is not None}")
+                st.write(f"bm25_code: {r.bm25_code is not None}")
             except Exception as exc:
                 st.error(
                     f"Could not load index: {exc}\n\n"
@@ -501,39 +508,41 @@ def main() -> None:
                 )
 
                 # Sources
-                st.markdown(
-                    '<div class="section-label">Sources</div>',
-                    unsafe_allow_html=True
-                )
-                for i, source in enumerate(sources, 1):
-                    # Read chunk text for preview
-                    text_preview = ""
-                    abs_path = os.path.join(
-                        REPO_ROOT, source.file_path
+                not_found = "Not found in the provided sources" in answer
+                if not not_found:
+                    st.markdown(
+                        '<div class="section-label">Sources</div>',
+                        unsafe_allow_html=True
                     )
-                    if not os.path.isfile(abs_path):
-                        abs_path = source.file_path
-                    if os.path.isfile(abs_path):
-                        try:
-                            with open(
-                                abs_path, "r",
-                                encoding="utf-8", errors="ignore"
-                            ) as fh:
-                                content = fh.read()
-                            text_preview = content[
-                                source.first_character_index:
-                                source.last_character_index
-                            ]
-                        except (OSError, IndexError):
-                            pass
+                    for i, source in enumerate(sources, 1):
+                        # Read chunk text for preview
+                        text_preview = ""
+                        abs_path = os.path.join(
+                            REPO_ROOT, source.file_path
+                        )
+                        if not os.path.isfile(abs_path):
+                            abs_path = source.file_path
+                        if os.path.isfile(abs_path):
+                            try:
+                                with open(
+                                    abs_path, "r",
+                                    encoding="utf-8", errors="ignore"
+                                ) as fh:
+                                    content = fh.read()
+                                text_preview = content[
+                                    source.first_character_index:
+                                    source.last_character_index
+                                ]
+                            except (OSError, IndexError):
+                                pass
 
-                    render_source_card(
-                        index=i,
-                        file_path=source.file_path,
-                        first_char=source.first_character_index,
-                        last_char=source.last_character_index,
-                        text_preview=text_preview,
-                    )
+                        render_source_card(
+                            index=i,
+                            file_path=source.file_path,
+                            first_char=source.first_character_index,
+                            last_char=source.last_character_index,
+                            text_preview=text_preview,
+                        )
 
         elif run and (not query or not query.strip()):
             st.warning("Write a question first.")

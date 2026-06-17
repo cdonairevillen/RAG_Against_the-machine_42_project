@@ -49,7 +49,7 @@ run:
 	$(ENV) $(UV) run --project . $(PY) -m src $(ARGS)
 
 web:
-	$(ENV) $(UV) run streamlit run src/web.py
+	$(ENV) $(UV) run streamlit run src/web.py &
 	@echo "Web running at http://localhost:8501"
 
 web-stop:

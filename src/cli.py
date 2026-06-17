@@ -246,17 +246,20 @@ class CLI:
         print(f"\nPrompt: \"{query}\"\n")
         print("=== Answer ===")
         print(response)
-        print("\n=== Sources ===")
-        for i, src in enumerate(sources):
-            chunk = self.find_chunk(retriever, src)
-            print(f"[{i + 1}] filepath: {src.file_path}")
-            print(f"    chunk:    {i}")
-            print(f"    range:    {src.first_character_index}:"
-                  f"{src.last_character_index}")
-            if chunk:
-                preview = chunk.text[:200].replace("\n", " ")
-                print(f"    text:     {preview}...")
-            print()
+
+        not_found = "Not found in the provided sources" in response
+        if not not_found:
+            print("\n=== Sources ===")
+            for i, src in enumerate(sources):
+                chunk = self.find_chunk(retriever, src)
+                print(f"[{i + 1}] filepath: {src.file_path}")
+                print(f"    chunk:    {i}")
+                print(f"    range:    {src.first_character_index}:"
+                    f"{src.last_character_index}")
+                if chunk:
+                    preview = chunk.text[:200].replace("\n", " ")
+                    print(f"    text:     {preview}...")
+                print()
 
     def answer_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/answers",
