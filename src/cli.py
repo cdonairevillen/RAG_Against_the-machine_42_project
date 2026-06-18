@@ -1,4 +1,4 @@
-from src.retriever import Retriever
+from src.retriever import Retriever, expand_query
 from src.generator import Generator
 from src.ingester import Chunk
 from pydantic import BaseModel
@@ -67,7 +67,7 @@ class CLI:
         self.retriever: Retriever | None = None
         self.generator: Generator | None = None
 
-    def get_retriever(self, with_reranker: bool = False) -> Retriever:
+    def get_retriever(self, with_reranker: bool = True) -> Retriever:
         """Load and cache the Retriever.
 
         Args:
@@ -109,9 +109,11 @@ class CLI:
                 raise
         return self.generator
 
-    def index(self, repo_root: str = REPO_ROOT, code_chunk_size: int = 1200,
-              doc_chunk_size: int = 2000, output_dir: str = PROCESSED_DIR,
-              use_embeddings: bool = True) -> None:
+    def index(self, repo_root: str = REPO_ROOT,
+              max_chunk_size: int = 2000,
+              code_chunk_size: int = 1200, doc_chunk_size: int = 2000,
+              output_dir: str = PROCESSED_DIR,
+              use_embeddings: bool = False) -> None:
         """Ingest the vLLM repository and persist BM25 and embedding indices.
 
         Args:
@@ -122,6 +124,10 @@ class CLI:
             use_embeddings: Build semantic embedding index alongside BM25.
         """
         from src.ingester import Ingester
+
+        if max_chunk_size != 2000:
+            code_chunk_size = max_chunk_size
+            doc_chunk_size = max_chunk_size
 
         if not os.path.isdir(repo_root):
             print(f"Error: repository not found at '{repo_root}'")
@@ -202,10 +208,15 @@ class CLI:
 
         results: list[MinimalSearchResults] = []
         for question in tqdm(dataset.rag_questions, desc="Searching"):
-            sources = retriever.search_with_fallback(question.question, k=k)
+
+            # NOTE: search_with_type_fallback() is available
+            # but disabled here — without reranker, the imbalanced corpus
+            # causes type misclassification that hurts recall. Used only in
+            # answer_dataset where the reranker corrects the bias.
+            sources = retriever.search(question.question, k=k)
             results.append(MinimalSearchResults(
                 question_id=question.question_id,
-                question=question.question,
+                question_str=question.question,
                 retrieved_sources=sources,
             ))
 
@@ -285,9 +296,8 @@ class CLI:
             print(f"Error reading dataset: {exc}")
             return
 
-        use_reranker = not skip_generation
         try:
-            retriever = self.get_retriever(with_reranker=use_reranker)
+            retriever = self.get_retriever(with_reranker=True)
         except Exception:
             return
 
@@ -302,27 +312,40 @@ class CLI:
         search_only: list[MinimalSearchResults] = []
         desc = "Retrieving" if skip_generation else "RAG pipeline"
 
-        for question in tqdm(dataset.rag_questions, desc=desc):
-            if skip_generation:
-                sources = retriever.search(question.question, k=k)
+        if skip_generation:
+            questions_list = [q.question for q in dataset.rag_questions]
+            expanded_list = [
+                expand_query(q)
+                for q in tqdm(questions_list, desc="Expanding")
+            ]
+            fetch_k = min(k * 5, len(self.retriever.chunks))
+            candidates_list = [
+                retriever.search_triple_rrf(q, k=fetch_k)
+                for q in tqdm(questions_list, desc="Triple RRF")
+            ]
+            reranked_list = retriever.rerank_batch(
+                questions_list, candidates_list, k=k
+            )
+            for question, sources in zip(dataset.rag_questions, reranked_list):
                 search_only.append(MinimalSearchResults(
                     question_id=question.question_id,
-                    question=question.question,
+                    question_str=question.question,
                     retrieved_sources=sources,
                 ))
-            else:
+        else:
+            for question in tqdm(dataset.rag_questions, desc=desc):
                 sources = retriever.search_for_generation(
                     question.question, k=k
                 )
                 try:
-                    response = generator.answer(  # type: ignore
+                    response = generator.answer(
                         question.question, sources
                     )
                 except Exception:
                     response = "Error generating answer."
                 answers.append(MinimalAnswer(
                     question_id=question.question_id,
-                    question=question.question,
+                    question_str=question.question,
                     retrieved_sources=sources,
                     answer=response,
                 ))

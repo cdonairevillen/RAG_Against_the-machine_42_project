@@ -108,13 +108,145 @@ class Retriever:
         self.embeddings = embeddings
         self.embed_model = None
         self.reranker = None
+        self.chunk_map: dict = {}
+
+        # Legacy - search_with_fallbackLE INDENT
+
         self.bm25_docs: Optional[bm25s.BM25] = None
         self.bm25_code: Optional[bm25s.BM25] = None
-        self.doc_indices: list[int] = []
-        self.code_indices: list[int] = []
+        self.doc_chunks: list[Chunk] = []
+        self.code_chunks: list[Chunk] = []
 
+        # Legacy - search_with_fallbackLE INDENT
+        
         if embeddings is not None:
             self.load_embed_model()
+
+    def search_with_type_fallback(
+        self, query: str, k: int = 10
+    ) -> list[MinimalSource]:
+        """Search using type detection from first BM25 result.
+
+        Gets top-1 from general index to detect query type (doc vs code),
+        then searches the matching subindex for top-k results.
+        Falls back to general search if subindices unavailable.
+
+        Args:
+            query: Natural-language search string.
+            k: Number of results to return.
+
+        Returns:
+            Ranked list of MinimalSource objects.
+        """
+        if not query or not query.strip() or k <= 0:
+            return []
+
+        if self.bm25_docs is None or self.bm25_code is None:
+            return self.search(query, k)
+
+        expanded = expand_query(query)
+
+        # Step 1 — get top-3 from general to detect type
+        top3 = self.search_bm25(expanded, 3, min_score=0.0)
+        if not top3:
+            return self.search(query, k)
+
+        chunk_map = self.get_chunk_map()
+        doc_count = 0
+        code_count = 0
+        for source in top3:
+            chunk = chunk_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if chunk and chunk.chunk_type == "doc":
+                doc_count += 1
+            elif chunk and chunk.chunk_type == "code":
+                code_count += 1
+
+            if doc_count >= 2:
+                subindex = self.bm25_docs
+                sub_chunks = self.doc_chunks
+            else:
+                subindex = self.bm25_code
+                sub_chunks = self.code_chunks
+        
+        # Step 2 — search in matching subindex
+        try:
+            tokenized = bm25s.tokenize(
+                [expanded], stopwords="en", show_progress=False
+            )
+            effective_k = min(k, len(sub_chunks))
+            results, _ = subindex.retrieve(
+                tokenized, k=effective_k, show_progress=False
+            )
+            local_indices: list[int] = results[0].tolist()
+        except Exception:
+            return self.search(query, k)
+
+        return [
+            self.chunk_to_source(sub_chunks[int(i)])
+            for i in local_indices
+        ]
+
+    def rerank_batch(self, queries: list[str],
+                     sources_list: list[list[MinimalSource]],
+                     k: int) -> list[list[MinimalSource]]:
+        """Rerank candidates for multiple queries in a single batch call.
+
+        More efficient than calling rerank() per query because the cross-encoder
+        processes all pairs in one forward pass instead of N separate calls.
+
+        Args:
+            queries: List of original search strings.
+            sources_list: Parallel list of candidate MinimalSource lists.
+            k: Number of top results to return per query.
+
+        Returns:
+            List of reranked MinimalSource lists, one per query.
+        """
+        if self.reranker is None:
+            return [s[:k] for s in sources_list]
+
+        chunk_map = self.get_chunk_map()
+        all_pairs: list[tuple[str, str]] = []
+        offsets: list[int] = [0]
+
+        for query, sources in zip(queries, sources_list):
+            for source in sources:
+                chunk = chunk_map.get(
+                    (source.file_path, source.first_character_index)
+                )
+                text = chunk.text if chunk else source.file_path
+                all_pairs.append((query, text))
+            offsets.append(len(all_pairs))
+
+        if not all_pairs:
+            return [s[:k] for s in sources_list]
+
+        all_scores: list[float] = self.reranker.predict(
+            all_pairs, show_progress_bar=True).tolist()
+
+        results: list[list[MinimalSource]] = []
+        for i, sources in enumerate(sources_list):
+            start, end = offsets[i], offsets[i + 1]
+            query_scores = all_scores[start:end]
+            ranked = sorted(
+                zip(query_scores, sources),
+                key=lambda x: x[0],
+                reverse=True
+            )
+            results.append([s for _, s in ranked[:k]])
+
+        return results
+
+    def get_chunk_map(self) -> dict:
+        """Return cached chunk map for fast lookup by (file_path, first_char)."""
+        if not self.chunk_map:
+            self.chunk_map = {
+                (c.file_path, c.first_character_index): c
+                for c in self.chunks
+            }
+        return self.chunk_map
 
     def load_embed_model(self) -> None:
         """Load the sentence-transformers model for query encoding.
@@ -164,10 +296,14 @@ class Retriever:
             bm25=ingester.bm25,
             embeddings=ingester.embeddings,
         )
+
+        # Legacy - search_with_fallbackLE INDENT
         retriever.bm25_docs = ingester.bm25_docs
         retriever.bm25_code = ingester.bm25_code
-        retriever.doc_indices = ingester.doc_indices
-        retriever.code_indices = ingester.code_indices
+        retriever.doc_chunks = [c for c in ingester.chunks if c.chunk_type == "doc"]
+        retriever.code_chunks = [c for c in ingester.chunks if c.chunk_type == "code"]
+        # Legacy - search_with_fallbackLE INDENT
+
         return retriever
 
     def search(self, query: str, k: int = 10) -> list[MinimalSource]:
@@ -190,6 +326,26 @@ class Retriever:
         if self.embeddings is not None and self.embed_model is not None:
             return self.search_hybrid(expanded, k)
         return self.search_bm25(expanded, k, min_score=0.0)
+    
+    def get_top_bm25_score(self, query: str) -> float:
+        """Return the highest BM25 score for a query over the corpus.
+
+        Args:
+            query: Search string.
+
+        Returns:
+            Highest score, or 0.0 on error.
+        """
+        try:
+            tokenized = bm25s.tokenize(
+                [query], stopwords="en", show_progress=False
+            )
+            _, scores = self.bm25.retrieve(
+                tokenized, k=1, show_progress=False
+            )
+            return float(scores[0][0])
+        except Exception:
+            return 0.0
 
     def search_for_generation(self, query: str,
                               k: int = 10) -> list[MinimalSource]:
@@ -207,10 +363,10 @@ class Retriever:
             Reranked list of MinimalSource objects, best match first.
         """
 
-        if self.get_top_bm25_score(query) < 4.5:
-            return []
-
         if not query or not query.strip() or k <= 0:
+            return []
+        
+        if self.get_top_bm25_score(query) < 4.5:
             return []
 
         if self.reranker is None:
@@ -222,97 +378,9 @@ class Retriever:
         if self.embeddings is not None and self.embed_model is not None:
             candidates = self.search_hybrid(expanded, fetch_k)
         else:
-            candidates = self.search_bm25(expanded, fetch_k, min_score=1.0)
+            candidates = self.search_bm25(expanded, fetch_k, min_score=0.0)
 
         return self.rerank(query, candidates, k)
-
-    def search_with_fallback(
-        self, query: str, k: int = 10
-    ) -> list[MinimalSource]:
-        """Triple-index search with majority-vote subindex selection.
-
-        First searches the general index to detect query type (doc vs code)
-        from the top-3 results. Then refines in the winning subindex.
-        Falls back to general results if subindices are unavailable.
-
-        Args:
-            query: Natural-language search string.
-            k: Number of results to return.
-
-        Returns:
-            Ranked list of MinimalSource objects.
-        """
-        if not query or not query.strip() or k <= 0:
-            return []
-
-        if self.bm25_docs is None or self.bm25_code is None:
-            return self.search(query, k)
-
-        expanded = expand_query(query, self.chunks)
-
-        # Step 1 — general search to detect query type
-        general = self.search_bm25(expanded, 3, min_score=0.0)
-        if not general:
-            return []
-
-        # Step 2 — majority vote on chunk type
-        doc_count = 0
-        code_count = 0
-        chunk_map = {
-            (c.file_path, c.first_character_index): c
-            for c in self.chunks
-        }
-        for source in general:
-            chunk = chunk_map.get(
-                (source.file_path, source.first_character_index)
-            )
-            if chunk and chunk.chunk_type == "doc":
-                doc_count += 1
-            elif chunk and chunk.chunk_type == "code":
-                code_count += 1
-
-        # Step 3 — refine in the winning subindex
-        if doc_count > code_count:
-            subindex = self.bm25_docs
-            global_map = self.doc_indices
-        elif code_count > doc_count:
-            subindex = self.bm25_code
-            global_map = self.code_indices
-        else:
-            return self.search_bm25(expanded, k, min_score=0.0)
-
-        try:
-            tokenized = bm25s.tokenize(
-                [expanded], stopwords="en", show_progress=False
-            )
-            effective_k = min(k, len(global_map))
-            results, _ = subindex.retrieve(
-                tokenized, k=effective_k, show_progress=False
-            )
-            local_indices: list[int] = results[0].tolist()
-        except Exception:
-            return self.search_bm25(expanded, k, min_score=0.0)
-
-        return [
-            self.chunk_to_source(self.chunks[global_map[int(i)]])
-            for i in local_indices
-        ]
-
-    def search_batch(self, questions: list[str],
-                     k: int = 10) -> list[list[MinimalSource]]:
-        """Run search() over a list of questions with a progress bar.
-
-        Args:
-            questions: List of natural-language question strings.
-            k: Number of results per question.
-
-        Returns:
-            List of MinimalSource lists, one per question, same order.
-        """
-        return [
-            self.search_with_fallback(q, k=k)
-            for q in tqdm(questions, desc="Searching")
-        ]
 
     def search_bm25(self, query: str, k: int,
                     min_score: float = 0.0) -> list[MinimalSource]:
@@ -341,27 +409,6 @@ class Retriever:
         return [self.chunk_to_source(self.chunks[int(idx)])
                 for idx, score in zip(indices, result_scores)
                 if score >= min_score]
-
-    def get_top_bm25_score(self, query: str) -> float:
-
-        """Returns the highest BM25 score for a query over the corpus
-
-        Args:
-            query: Search thing
-
-        Returns:
-        Highest score, or 0.0 on error.
-        """
-        try:
-            tokenized = bm25s.tokenize([query], stopwords="en",
-                                       show_progress=False)
-
-            _, scores = self.bm25.retrieve(tokenized, k=1, show_progress=False)
-
-            return float(scores[0][0])
-
-        except Exception:
-            return 0.0
 
     def search_hybrid(self, query: str, k: int) -> list[MinimalSource]:
         """Hybrid retrieval: BM25 + semantic embeddings fused with RRF.
@@ -415,10 +462,7 @@ class Retriever:
         if self.reranker is None or not sources:
             return sources[:k]
 
-        chunk_map = {
-            (c.file_path, c.first_character_index): c
-            for c in self.chunks
-        }
+        chunk_map = self.get_chunk_map()
 
         pairs: list[tuple[str, str]] = []
         for source in sources:
@@ -494,23 +538,3 @@ class Retriever:
             last_character_index=chunk.last_character_index,
         )
 
-    def overlap_ratio(self, gt: tuple[str, int, int],
-                      ret: tuple[str, int, int]) -> float:
-        """Return fraction of ground-truth range covered by a retrieved chunk.
-
-        Args:
-            gt: (file_path, first_char, last_char) ground-truth source.
-            ret: (file_path, first_char, last_char) retrieved source.
-
-        Returns:
-            Float in [0.0, 1.0]. 0.0 if files differ or no overlap.
-        """
-        gt_file, gt_start, gt_end = gt
-        ret_file, ret_start, ret_end = ret
-
-        if gt_file != ret_file:
-            return 0.0
-
-        overlap = max(0, min(gt_end, ret_end) - max(gt_start, ret_start))
-        gt_length = gt_end - gt_start
-        return overlap / gt_length if gt_length > 0 else 0.0

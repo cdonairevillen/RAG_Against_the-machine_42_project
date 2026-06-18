@@ -11,10 +11,11 @@ ENV       := HF_HOME=$(HF) \
 			 TRANSFORMERS_CACHE=$(HF) \
 			 HF_DATASETS_CACHE=$(HF) \
 			 UV_CACHE_DIR=$(CACHE) \
-			 TMPDIR=$(TMP)
+			 TMPDIR=$(TMP) \
 
 install:
 	@echo "Generating folder structure..."
+	@rm -rf data/
 	@mkdir -p $(BASE) $(CACHE) $(TMP) $(HF)
 	@mkdir -p data/raw \
 			 data/processed \
@@ -58,11 +59,11 @@ web-stop:
 
 index:
 	$(ENV) $(UV) run --project . $(PY) -m src index \
-		--code_chunk_size 1200 --doc_chunk_size 2000 --use_embeddings False
+		--max_chunk_size 2000 --use_embeddings False
 
 index-embed:
 	$(ENV) $(UV) run --project . $(PY) -m src index \
-		--code_chunk_size 1200 --doc_chunk_size 2000 --use_embeddings True
+		--max_chunk_size 2000 --use_embeddings True
 
 search-docs:
 	$(ENV) $(UV) run --project . $(PY) -m src answer_dataset \
@@ -112,6 +113,26 @@ meme:
 	@echo "https://www.youtube.com/watch?v=bWXazVhlyxQ"
 	$(ENV) $(UV) run streamlit run src/web.py &
 	@echo "Web running at http://localhost:8501"
+
+test-docs-fast:
+
+	$(ENV) $(UV) run --project . $(PY) -m src answer_dataset \
+		--dataset_path data/datasets/private/UnansweredQuestions/dataset_docs_private.json \
+		--save_directory data/output/search_results \
+		--k 15
+
+test-docs:
+	$(ENV) $(UV) run --project . $(PY) -m src answer_dataset \
+		--dataset_path data/datasets/private/UnansweredQuestions/dataset_code_private.json \
+		--skip_generation True \
+		--save_directory data/output/search_results \
+		--k 10
+
+test-eval-docs:
+	$(ENV) $(UV) run --project . $(PY) -m src evaluate \
+		--student_answer_path data/output/search_results/dataset_code_private.json \
+		--dataset_path data/datasets/private/AnsweredQuestions/dataset_code_private.json \
+		--k 10
 
 .PHONY: install run web web-stop index index-fast search-docs search-code \
         eval-docs eval-code lint clean meme

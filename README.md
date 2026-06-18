@@ -1,6 +1,6 @@
-# RAG against the Machine
+*This project has been created as part of the 42 curriculum by cdonaire*
 
-*This project has been created as part of the 42 curriculum by cdonaire.*
+# RAG against the Machine
 
 ---
 
@@ -45,11 +45,11 @@ Before running any queries, the vLLM repository must be indexed.
 Place the unzipped repository at `data/raw/vllm-0.10.1/` and run:
 
 ```bash
-# Full index with semantic embeddings (~10 min on CPU)
+# Fast index without embeddings (~15s, used for evaluation)
 make index
 
-# Fast index without embeddings (~2 min, sufficient for evaluation)
-make index-fast
+# Full index with semantic embeddings (~10 min on CPU, optional bonus)
+make index-embed
 ```
 
 ### Running the system
@@ -98,7 +98,7 @@ The pipeline is composed of five main components:
 vLLM Repository
       │
       ▼
- [Ingester]  — chunks files, builds BM25 + embedding indices
+ [Ingester]  — chunks files, builds BM25 + subindices + optional embeddings
       │
       ▼
  [Retriever] — searches indices, applies query expansion, reranking
@@ -118,9 +118,10 @@ strategies, and builds three BM25 indices (general, docs-only, code-only)
 plus an optional semantic embedding index.
 
 **Retriever** exposes two search modes: a fast BM25 path for dataset
-evaluation, and a precise path with cross-encoder reranking for LLM
-generation. It also implements triple-index search with majority-vote
-subindex selection.
+evaluation (`search()`), and a precise path with cross-encoder reranking
+for LLM generation (`search_for_generation()`). Also implements
+`search_with_type_fallback()` and `search_triple_rrf()` as experimental
+alternatives (see Design Decisions).
 
 **Generator** uses Qwen/Qwen3-0.6B via HuggingFace Transformers with
 a strict RAG prompt that prevents hallucination. Generation uses greedy
@@ -130,7 +131,7 @@ decoding via the native `model.generate()` for KV-cache efficiency.
 as a hit when it overlaps at least 5% with any ground-truth source,
 measured in characters.
 
-**CLI** is a single `StudentCLI` class that lazily loads the Retriever
+**CLI** is a single `CLI` class that lazily loads the Retriever
 and Generator on first use and reuses them across all commands.
 
 ---
@@ -200,28 +201,32 @@ paged_attention`) and snake_case identifiers are split into parts. Symbol
 names from matching chunks are also appended, allowing BM25 to match
 queries that reference specific class or method names.
 
-### Triple-index search with majority vote
+### Triple-index search (experimental)
 
-For evaluation queries, `search_with_fallback` first retrieves the top-3
-results from the general index and counts how many are doc-type versus
-code-type. The winning type determines which subindex is used for the
-final top-k retrieval. In case of a tie, the general index result is
-returned directly.
+`search_with_type_fallback` detects query type from the top-3 general
+results and routes to the matching subindex. `search_triple_rrf` fuses
+all three indices with weighted RRF. Both are disabled during evaluation
+due to the corpus imbalance (93% code) — without a reranker to correct
+misclassifications, routing hurts docs recall. Available for interactive
+use where the reranker corrects bias.
 
 ### Semantic embeddings (optional bonus)
 
 When enabled with `--use_embeddings True`, the system encodes all chunks
 with `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, L2-normalised)
 and fuses BM25 and cosine similarity rankings with Reciprocal Rank Fusion
-(RRF, k=60).
+(RRF, k=60). Embeddings improve code recall (+7%) but add ~10 minutes to
+indexing time, so they are disabled by default.
 
 ### Cross-encoder reranking (for generation only)
 
 When answering questions, the system retrieves k×5 candidates with BM25,
 then reranks them with `cross-encoder/ms-marco-MiniLM-L-6-v2`. The
 cross-encoder scores each (query, chunk) pair jointly, producing a
-relevance score more accurate than BM25 alone. This step is skipped
-during dataset evaluation to meet the 90-second throughput requirement.
+relevance score more accurate than BM25 alone. Batch reranking is used
+for efficiency — all pairs are scored in a single forward pass. This
+step is skipped during dataset evaluation to meet the 90-second
+throughput requirement.
 
 ### Relevance filtering
 
@@ -233,30 +238,32 @@ an empty result without invoking the LLM.
 
 ## Performance Analysis
 
-Results on the public evaluation datasets (Recall@5):
+Results on the private evaluation datasets (Recall@5):
 
 | Dataset | Recall@1 | Recall@3 | Recall@5 | Recall@10 |
 |---------|----------|----------|----------|-----------|
-| Docs    | 0.550    | 0.780    | 0.850    | 0.890     |
-| Code    | 0.380    | 0.500    | 0.540    | 0.630     |
+| Docs    | 0.530    | 0.730    | 0.800    | 0.860     |
+| Code    | 0.250    | 0.480    | 0.530    | 0.590     |
 
 Both datasets exceed the mandatory thresholds (≥0.80 for docs, ≥0.50
 for code).
 
 **Performance constraints met:**
-- Indexing time: < 5 minutes (BM25 only)
-- Cold start latency: < 60 seconds
-- Warm retrieval throughput: 100 questions in < 5 seconds
+- Indexing time: 13s (BM25 only, limit 300s)
+- Warm retrieval throughput: 200 questions in 23s (limit 90s)
 
 ---
 
 ## Design Decisions
 
-**Single unified BM25 index for evaluation.** An early attempt at dual
-indexing (separate doc and code indices with RRF fusion) caused the code
-recall to collapse from 0.550 to 0.220 because the two indices had very
-different sizes (1,701 doc vs 17,880 code chunks), creating a ranking
-imbalance. A unified index lets BM25 rank all chunks fairly.
+**Single unified BM25 index for evaluation.** Three BM25 indices are
+built (general, docs, code) but evaluation uses only the general index.
+Experiments with type-based routing (majority vote on top-3 BM25 results)
+showed that the corpus imbalance (1,701 doc vs 25,085 code chunks, i.e.
+93% code) causes almost all queries to be routed to the code subindex,
+collapsing docs recall from 0.800 to 0.700. The subindices are used in
+`search_with_type_fallback` and `search_triple_rrf` for interactive use,
+where the cross-encoder reranker corrects misclassifications.
 
 **AST chunking over line-based splitting.** Cutting a function in half
 destroys its meaning. AST extraction guarantees the LLM always receives
@@ -269,10 +276,11 @@ normalisation, reducing recall. Storing them in a separate field and
 using them only for query expansion avoids this penalty.
 
 **Reranker only for generation, not evaluation.** The cross-encoder
-reranker improves answer quality but processes 50 candidates per query,
-taking ~1-2 seconds each. For the 1,000-question throughput requirement,
-this would take ~30 minutes. The reranker is therefore applied only when
-generating answers, not during dataset evaluation.
+reranker improves retrieval quality (Docs @5: 0.800 → 0.820) but
+processing 50 candidates per query takes ~2 seconds on CPU. For the
+200-question throughput test this would exceed the 90-second limit.
+The reranker is applied only when generating answers, using batch
+prediction to score all pairs in a single forward pass for efficiency.
 
 **Native `model.generate()` instead of manual greedy decoding.** The
 SDK's `get_logits_from_input_ids()` recomputes all previous tokens on
@@ -318,17 +326,25 @@ invalid queries established 4.5 as a reliable threshold that separates
 relevant queries (score ≥ 5.3) from irrelevant ones (score ≤ 3.3).
 
 **Embeddings degrading docs recall.** The generic `all-MiniLM-L6-v2`
-model, while effective for code questions, slightly reduced docs recall
-from 0.850 to 0.820. Embeddings are therefore optional and disabled by
-default for evaluation, but available as a bonus feature.
+model improves code recall (+7%) but slightly reduces docs recall from
+0.800 to 0.820 — a net tradeoff. More critically, encoding 26,786 chunks
+takes ~10 minutes, exceeding the 300-second indexing limit. Embeddings
+are therefore optional and disabled by default.
+
+**Triple indexation with imbalanced corpus.** Routing queries to doc or
+code subindices based on BM25 top-k majority vote failed because 93% of
+chunks are code — almost all queries were routed to the code subindex
+regardless of type, collapsing docs recall from 0.800 to 0.700.
+Variants tested: top-1, top-3, top-7, `doc_count >= 1`, RRF with dynamic
+weights. All variants either hurt docs or hurt code. The approach works
+when the cross-encoder reranker corrects misclassifications but violates
+the throughput constraint during evaluation.
 
 ---
 
-## Example Usage
-
 ```bash
 # Build the index
-make index-fast
+make index
 
 # Answer a question about vLLM internals
 make run ARGS="answer 'How does PagedAttention manage KV cache blocks?' --k 5"

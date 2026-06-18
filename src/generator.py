@@ -9,33 +9,27 @@ def build_prompt(question: str, context_blocks: list[str]) -> str:
     """Assemble prompt using Qwen3 chat format with thinking disabled."""
     context_section = "\n\n".join(context_blocks)
     system = (
-        "You are a read-only technical documentation assistant for the "
-        "vLLM codebase. Your only job is to answer questions using the "
-        "SOURCE CODE AND DOCUMENTATION provided below.\n\n"
-        "STRICT RULES — follow all of them:\n"
-        "1. Use ONLY information explicitly stated in the context. "
-        "Never infer, guess, or complete missing information.\n"
-        "2. If the context contains a function definition or template "
-        "string, do NOT simulate calling it or filling its placeholders. "
-        "Code is not data.\n"
-        "3. If the context contains example or test code with hardcoded "
-        "values, do NOT treat those values as real facts.\n"
-        "4. If the answer is not explicitly present in the context, "
-        "respond ONLY with exactly this and nothing else: "
-        "'Not found in the provided sources.'\n"
-        "5. Never use your training knowledge. If you know the answer "
-        "but it is not in the context, still respond ONLY with: "
-        "'Not found in the provided sources.'\n"
-        "6. Keep your answer concise. If you found the answer, always "
-        "cite the source file at the end.\n\n"
-        "FORMAT when answer IS found: direct answer + 'Source: <filenames>' "
-        "<filenames> will be filled with all the files where your answer comes"
-        " from\n"
-        "FORMAT when answer IS NOT found: 'Not found in the provided sources.'"
-        "BEFORE ANSWERING, verify: does the context explicitly contain "
-        "the answer to the question? If NO, respond ONLY with: "
-        "'Not found in the provided sources.' — do not use any other "
-        "knowledge under any circumstances.\n"
+    "You are a read-only technical documentation assistant for the "
+    "vLLM codebase. Your only job is to answer questions using the "
+    "SOURCE CODE AND DOCUMENTATION provided below.\n\n"
+    "STRICT RULES — follow all of them:\n"
+    "1. Use ONLY information explicitly stated in the context. "
+    "Never infer, guess, or complete missing information.\n"
+    "2. If the context contains a function definition or template "
+    "string, do NOT simulate calling it or filling its placeholders. "
+    "Code is not data.\n"
+    "3. If the context contains example or test code with hardcoded "
+    "values, do NOT treat those values as real facts.\n"
+    "4. If the answer is not EXPLICITLY AND DIRECTLY stated in the context, "
+    "respond ONLY with: 'Not found in the provided sources.' "
+    "Partial or related information is not enough — only direct answers.\n"
+    "5. Never use your training knowledge. If you know the answer "
+    "but it is not in the context, respond ONLY with: "
+    "'Not found in the provided sources.'\n"
+    "6. Keep your answer concise. If you found the answer, always "
+    "cite the source file at the end.\n\n"
+    "FORMAT when answer IS found: direct answer + 'Source: <filenames>'\n"
+    "FORMAT when answer IS NOT found: 'Not found in the provided sources.'\n"
     )
     user_content = (
         f"CONTEXT:\n{context_section}\n\nQUESTION: {question} /no_think"
@@ -167,7 +161,7 @@ class Generator:
         except (OSError, IndexError):
             return ""
 
-    def truncate_prompt(self, prompt: str, max_chars: int = 3000) -> str:
+    def truncate_prompt(self, prompt: str, max_chars: int = 10000) -> str:
         """Truncate the prompt to stay within a reasonable token budget.
 
         Keeps the system prompt and question intact; truncates only the
@@ -204,7 +198,7 @@ class Generator:
             prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=2048,
+            max_length=4096,
         ).to(self.model._device)
 
         eos_token = self.model._tokenizer.encode("<|im_end|>")[0]

@@ -7,7 +7,6 @@ from typing import Generator, Optional
 import bm25s
 import numpy as np
 from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
 
 
 INCLUDE_EXTENSIONS = {".py", ".pyi", ".md", ".rst", ".txt"}
@@ -378,10 +377,12 @@ class Ingester:
         self.doc_chunk_size = doc_chunk_size
         self.chunks: list[Chunk] = []
         self.bm25: Optional[bm25s.BM25] = None
-        self.bm25_code: Optional[bm25s.BM25] = None
-        self.doc_indices: list[int] = []
-        self.code_indices: list[int] = []
         self.embeddings: Optional[np.ndarray] = None
+
+        # Legacy - search_with_fallbackLE INDENT
+
+        self.bm25_docs: Optional[bm25s.BM25] = None
+        self.bm25_code: Optional[bm25s.BM25] = None
 
     def build(self, use_embeddings: bool = True) -> None:
         """Ingest the repository and fit the BM25 index.
@@ -392,18 +393,16 @@ class Ingester:
         """
         self.chunks = self.collect_chunks()
         self.bm25 = self.build_bm25(self.chunks)
-        self.doc_indices = [
-            i for i, c in enumerate(self.chunks) if c.chunk_type == "doc"
-        ]
-        self.code_indices = [
-            i for i, c in enumerate(self.chunks) if c.chunk_type == "code"
-        ]
-        self.bm25_docs = self.build_bm25(
-            [self.chunks[i] for i in self.doc_indices], label="docs"
-        )
-        self.bm25_code = self.build_bm25(
-            [self.chunks[i] for i in self.code_indices], label="code"
-        )
+
+        # Legacy - search_with_fallbackLE INDENT
+
+        doc_chunks = [c for c in self.chunks if c.chunk_type == "doc"]
+        code_chunks = [c for c in self.chunks if c.chunk_type == "code"]
+        self.bm25_docs = self.build_bm25(doc_chunks, label="docs")
+        self.bm25_code = self.build_bm25(code_chunks, label="code")
+
+        # Legacy - search_with_fallbackLE INDENT
+
         if use_embeddings:
             self.embeddings = self.build_embeddings(self.chunks)
 
@@ -434,21 +433,17 @@ class Ingester:
         index_dir = os.path.join(output_dir, self.INDEX_DIR)
         os.makedirs(index_dir, exist_ok=True)
         self.bm25.save(index_dir)
+
+        # Legacy - search_with_fallbackLE INDENT
+
         docs_dir = os.path.join(output_dir, "bm25_docs")
         code_dir = os.path.join(output_dir, "bm25_code")
         os.makedirs(docs_dir, exist_ok=True)
         os.makedirs(code_dir, exist_ok=True)
-        assert self.bm25_docs is not None
         self.bm25_docs.save(docs_dir)
-        assert self.bm25_code is not None
         self.bm25_code.save(code_dir)
 
-        meta_path = os.path.join(output_dir, "meta.json")
-        with open(meta_path, "w", encoding="utf-8") as fh:
-            json.dump({
-                "doc_indices": self.doc_indices,
-                "code_indices": self.code_indices,
-            }, fh)
+        #TRIPLE INDENT
 
         doc_count = sum(1 for c in self.chunks if c.chunk_type == "doc")
         code_count = sum(1 for c in self.chunks if c.chunk_type == "code")
@@ -486,10 +481,10 @@ class Ingester:
         index_dir = os.path.join(processed_dir, cls.INDEX_DIR)
         ingester.bm25 = bm25s.BM25.load(index_dir, load_corpus=False)
 
+        # Legacy - search_with_fallbackLE INDENT
+
         docs_dir = os.path.join(processed_dir, "bm25_docs")
         code_dir = os.path.join(processed_dir, "bm25_code")
-        meta_path = os.path.join(processed_dir, "meta.json")
-
         if os.path.isdir(docs_dir) and os.path.isdir(code_dir):
             ingester.bm25_docs = bm25s.BM25.load(docs_dir, load_corpus=False)
             ingester.bm25_code = bm25s.BM25.load(code_dir, load_corpus=False)
@@ -497,14 +492,7 @@ class Ingester:
             ingester.bm25_docs = None
             ingester.bm25_code = None
 
-        if os.path.isfile(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as fh:
-                meta = json.load(fh)
-            ingester.doc_indices = meta["doc_indices"]
-            ingester.code_indices = meta["code_indices"]
-        else:
-            ingester.doc_indices = []
-            ingester.code_indices = []
+        # Legacy - search_with_fallbackLE INDENT
 
         embed_path = os.path.join(processed_dir, cls.EMBEDDINGS_FILE)
         if os.path.isfile(embed_path):
@@ -598,6 +586,8 @@ class Ingester:
         Returns:
             numpy array of shape (n_chunks, 384), dtype float32.
         """
+
+        from sentence_transformers import SentenceTransformer
 
         print(f"Loading embedding model {self.EMBED_MODEL}...")
         model = SentenceTransformer(self.EMBED_MODEL)
