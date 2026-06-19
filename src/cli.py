@@ -1,4 +1,4 @@
-from src.retriever import Retriever, expand_query
+from src.retriever import Retriever
 from src.generator import Generator
 from src.ingester import Chunk
 from pydantic import BaseModel
@@ -202,18 +202,14 @@ class CLI:
             print(f"Error reading dataset: {exc}")
             return
         try:
-            retriever = self.get_retriever(with_reranker=False)
+            retriever = self.get_retriever(with_reranker=True)
         except Exception:
             return
 
         results: list[MinimalSearchResults] = []
         for question in tqdm(dataset.rag_questions, desc="Searching"):
 
-            # NOTE: search_with_type_fallback() is available
-            # but disabled here — without reranker, the imbalanced corpus
-            # causes type misclassification that hurts recall. Used only in
-            # answer_dataset where the reranker corrects the bias.
-            sources = retriever.search(question.question, k=k)
+            sources = retriever.search_for_generation(question.question, k=k)
             results.append(MinimalSearchResults(
                 question_id=question.question_id,
                 question_str=question.question,
@@ -313,41 +309,14 @@ class CLI:
         desc = "Retrieving" if skip_generation else "RAG pipeline"
 
         if skip_generation:
-            questions_list = [q.question for q in dataset.rag_questions]
-            expanded_list = [
-                expand_query(q)
-                for q in tqdm(questions_list, desc="Expanding")
-            ]
-            fetch_k = min(k * 5, len(self.retriever.chunks))
-            candidates_list = [
-                retriever.search_triple_rrf(q, k=fetch_k)
-                for q in tqdm(questions_list, desc="Triple RRF")
-            ]
-            reranked_list = retriever.rerank_batch(
-                questions_list, candidates_list, k=k
-            )
-            for question, sources in zip(dataset.rag_questions, reranked_list):
-                search_only.append(MinimalSearchResults(
-                    question_id=question.question_id,
-                    question_str=question.question,
-                    retrieved_sources=sources,
-                ))
-        else:
             for question in tqdm(dataset.rag_questions, desc=desc):
                 sources = retriever.search_for_generation(
                     question.question, k=k
                 )
-                try:
-                    response = generator.answer(
-                        question.question, sources
-                    )
-                except Exception:
-                    response = "Error generating answer."
-                answers.append(MinimalAnswer(
+                search_only.append(MinimalSearchResults(
                     question_id=question.question_id,
                     question_str=question.question,
                     retrieved_sources=sources,
-                    answer=response,
                 ))
 
         filename = os.path.basename(dataset_path)
@@ -408,14 +377,9 @@ class CLI:
         Returns:
             Matching Chunk or None if not found.
         """
-        for chunk in retriever.chunks:
-            if (
-                chunk.file_path == source.file_path
-                and chunk.first_character_index
-                == source.first_character_index
-            ):
-                return chunk
-        return None
+        chunk_map = retriever.get_chunk_map()
+        return chunk_map.get(
+            (source.file_path, source.first_character_index))
 
     @staticmethod
     def save_json(model: BaseModel, directory: str,

@@ -114,5 +114,28 @@ meme:
 	$(ENV) $(UV) run streamlit run src/web.py &
 	@echo "Web running at http://localhost:8501"
 
+
+test-docs:
+	$(ENV) uv run --project . python3 -m src search_dataset \
+		--dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json \
+		--save_directory data/output/search_results
+
+test-eval-docs:
+	$(ENV) uv run --project . python3 -m src evaluate \
+		--student_answer_path data/output/search_results/dataset_docs_public.json \
+		--dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json \
+		--k 10
+
+test-code:
+	$(ENV) uv run --project . python3 -m src search_dataset \
+		--dataset_path data/datasets/UnansweredQuestions/dataset_code_public.json \
+		--save_directory data/output/search_results
+
+test-eval-code:
+	$(ENV) uv run --project . python3 -m src evaluate \
+		--student_answer_path data/output/search_results/dataset_code_public.json \
+		--dataset_path data/datasets/AnsweredQuestions/dataset_code_public.json \
+		--k 10
+
 .PHONY: install run web web-stop index index-fast search-docs search-code \
         eval-docs eval-code lint clean meme

@@ -9,7 +9,7 @@ class Evaluator:
     A retrieved source counts as a hit when it overlaps at least 5% with
     any ground-truth source, measured in characters over ground-truth length:
 
-        overlap_chars / gt_length >= 0.05  →  hit
+        overlap_chars / gt_length >= 0.05  ->  hit
 
     For questions with multiple correct sources, each is scored independently
     and the question score is found / total (partial credit).

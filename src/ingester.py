@@ -24,9 +24,12 @@ OVERLAP_RATIO = 0.20
 DEFAULT_CODE_CHUNK_SIZE = 1200
 DEFAULT_DOC_CHUNK_SIZE = 2000
 
+DEFAULT_CODE_CHILD_SIZE = 600
+DEFAULT_DOC_CHILD_SIZE = 600
+
 
 @dataclass
-class Chunk:
+class Chunk():
     """A contiguous slice of a source file used as retrieval unit.
 
     Attributes:
@@ -46,6 +49,7 @@ class Chunk:
     last_character_index: int
     chunk_type: str
     symbols: str = field(default="")
+    parent_id: int = field(default=-1)
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict for JSON storage."""
@@ -361,10 +365,13 @@ class Ingester:
     INDEX_DIR = "bm25_index"
     EMBEDDINGS_FILE = "embeddings.npy"
     EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+    PARENT_CHUNKS_FILE = "parent_chunks.json"
 
     def __init__(self, repo_root: str,
                  code_chunk_size: int = DEFAULT_CODE_CHUNK_SIZE,
-                 doc_chunk_size: int = DEFAULT_DOC_CHUNK_SIZE) -> None:
+                 doc_chunk_size: int = DEFAULT_DOC_CHUNK_SIZE,
+                 code_child_size: int = DEFAULT_CODE_CHILD_SIZE,
+                 doc_child_size: int = DEFAULT_DOC_CHILD_SIZE) -> None:
         """Initialise the Ingester.
 
         Args:
@@ -373,16 +380,19 @@ class Ingester:
             doc_chunk_size: Maximum characters per doc chunk.
         """
         self.repo_root = repo_root
+
         self.code_chunk_size = code_chunk_size
+        self.code_child_size = code_child_size
+
         self.doc_chunk_size = doc_chunk_size
+        self.doc_child_size = doc_child_size
+
         self.chunks: list[Chunk] = []
+        self.parent_chunks: list[Chunk] = []
+
         self.bm25: Optional[bm25s.BM25] = None
+
         self.embeddings: Optional[np.ndarray] = None
-
-        # Legacy - search_with_fallbackLE INDENT
-
-        self.bm25_docs: Optional[bm25s.BM25] = None
-        self.bm25_code: Optional[bm25s.BM25] = None
 
     def build(self, use_embeddings: bool = True) -> None:
         """Ingest the repository and fit the BM25 index.
@@ -391,20 +401,16 @@ class Ingester:
             use_embeddings: When True, also encodes all chunks with
                 sentence-transformers for semantic search.
         """
-        self.chunks = self.collect_chunks()
+
+        self.parent_chunks = self.collect_chunks(
+            code_size = self.code_chunk_size,
+            doc_size=self.doc_chunk_size
+        )
+        self.chunks = self.collect_child_chunks()
         self.bm25 = self.build_bm25(self.chunks)
 
-        # Legacy - search_with_fallbackLE INDENT
-
-        doc_chunks = [c for c in self.chunks if c.chunk_type == "doc"]
-        code_chunks = [c for c in self.chunks if c.chunk_type == "code"]
-        self.bm25_docs = self.build_bm25(doc_chunks, label="docs")
-        self.bm25_code = self.build_bm25(code_chunks, label="code")
-
-        # Legacy - search_with_fallbackLE INDENT
-
         if use_embeddings:
-            self.embeddings = self.build_embeddings(self.chunks)
+            self.embeddings = self.build_embeddings(self.parent_chunks)
 
     def save(self, output_dir: str) -> None:
         """Persist all artefacts to disk.
@@ -434,16 +440,12 @@ class Ingester:
         os.makedirs(index_dir, exist_ok=True)
         self.bm25.save(index_dir)
 
-        # Legacy - search_with_fallbackLE INDENT
-
-        docs_dir = os.path.join(output_dir, "bm25_docs")
-        code_dir = os.path.join(output_dir, "bm25_code")
-        os.makedirs(docs_dir, exist_ok=True)
-        os.makedirs(code_dir, exist_ok=True)
-        self.bm25_docs.save(docs_dir)
-        self.bm25_code.save(code_dir)
-
-        #TRIPLE INDENT
+        parent_chunks_path = os.path.join(chunks_dir, self.PARENT_CHUNKS_FILE)
+        with open(parent_chunks_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                [c.to_dict() for c in self.parent_chunks],
+                fh, ensure_ascii=False
+            )
 
         doc_count = sum(1 for c in self.chunks if c.chunk_type == "doc")
         code_count = sum(1 for c in self.chunks if c.chunk_type == "code")
@@ -451,11 +453,12 @@ class Ingester:
             f"Saved {len(self.chunks)} chunks "
             f"({doc_count} doc, {code_count} code)"
         )
+        print(f"Saved {len(self.parent_chunks)} parent chunks")
 
         if self.embeddings is not None:
             embed_path = os.path.join(output_dir, self.EMBEDDINGS_FILE)
             np.save(embed_path, self.embeddings)
-            print(f"Saved embeddings {self.embeddings.shape} → {embed_path}")
+            print(f"Saved embeddings {self.embeddings.shape} -> {embed_path}")
 
     @classmethod
     def load(cls, processed_dir: str) -> "Ingester":
@@ -474,25 +477,21 @@ class Ingester:
 
         chunks_dir = os.path.join(processed_dir, "chunks")
         with open(
-            os.path.join(chunks_dir, cls.CHUNKS_FILE), "r", encoding="utf-8"
-        ) as fh:
+            os.path.join(chunks_dir, cls.CHUNKS_FILE),
+            "r", encoding="utf-8") as fh:
             ingester.chunks = [Chunk.from_dict(d) for d in json.load(fh)]
+
+        parent_path = os.path.join(chunks_dir, cls.PARENT_CHUNKS_FILE)
+        if os.path.isfile(parent_path):
+            with open(parent_path, "r", encoding="utf-8") as fh:
+                ingester.parent_chunks = [
+                    Chunk.from_dict(d) for d in json.load(fh)
+                ]
+        else:
+            ingester.parent_chunks = []
 
         index_dir = os.path.join(processed_dir, cls.INDEX_DIR)
         ingester.bm25 = bm25s.BM25.load(index_dir, load_corpus=False)
-
-        # Legacy - search_with_fallbackLE INDENT
-
-        docs_dir = os.path.join(processed_dir, "bm25_docs")
-        code_dir = os.path.join(processed_dir, "bm25_code")
-        if os.path.isdir(docs_dir) and os.path.isdir(code_dir):
-            ingester.bm25_docs = bm25s.BM25.load(docs_dir, load_corpus=False)
-            ingester.bm25_code = bm25s.BM25.load(code_dir, load_corpus=False)
-        else:
-            ingester.bm25_docs = None
-            ingester.bm25_code = None
-
-        # Legacy - search_with_fallbackLE INDENT
 
         embed_path = os.path.join(processed_dir, cls.EMBEDDINGS_FILE)
         if os.path.isfile(embed_path):
@@ -511,7 +510,10 @@ class Ingester:
         )
         return ingester
 
-    def collect_chunks(self) -> list[Chunk]:
+    def collect_chunks(self,
+                       code_size: int = DEFAULT_CODE_CHUNK_SIZE,
+                       doc_size: int = DEFAULT_DOC_CHUNK_SIZE
+                       ) -> list[Chunk]:
         """Walk the repository and produce all chunks.
 
         Returns:
@@ -535,21 +537,59 @@ class Ingester:
 
             _, ext = os.path.splitext(abs_path)
             if ext in CODE_EXTENSIONS:
-                file_chunks = chunk_python_file(
-                    rel_path, content, self.code_chunk_size
-                )
+                file_chunks = chunk_python_file(rel_path, content, code_size)
             elif ext in DOC_EXTENSIONS:
-                file_chunks = chunk_doc_file(
-                    rel_path, content, self.doc_chunk_size
-                )
+                file_chunks = chunk_doc_file(rel_path, content, doc_size)
             else:
-                file_chunks = chunk_text_file(
-                    rel_path, content, self.doc_chunk_size
-                )
+                file_chunks = chunk_text_file(rel_path, content, doc_size)
 
             all_chunks.extend(file_chunks)
 
         return all_chunks
+    
+    def collect_child_chunks(self) -> list[Chunk]:
+        """Generate small child chunks mapped to their parent chunks.
+
+        Each child has parent_id pointing to its parent in self.parent_chunks.
+        Children are used for BM25 retrieval; parents are passed to the LLM.
+
+        Returns:
+            Flat list of child Chunk objects with parent_id set.
+        """
+        children: list[Chunk] = []
+
+        for parent_idx, parent in enumerate(self.parent_chunks):
+            _, ext = os.path.splitext(parent.file_path)
+            if ext in CODE_EXTENSIONS:
+                child_size = self.code_child_size
+            else:
+                child_size = self.doc_child_size
+
+            if len(parent.text) <= child_size:
+                child = Chunk(
+                    text=parent.text,
+                    file_path=parent.file_path,
+                    first_character_index=parent.first_character_index,
+                    last_character_index=parent.last_character_index,
+                    chunk_type=parent.chunk_type,
+                    symbols=parent.symbols,
+                    parent_id=parent_idx,
+                )
+                children.append(child)
+            else:
+                sub_chunks = split_by_size(
+                    parent.text,
+                    parent.file_path,
+                    parent.chunk_type,
+                    child_size,
+                    parent.first_character_index,
+                    parent.symbols,
+                )
+                for sub in sub_chunks:
+                    sub.parent_id = parent_idx
+                    children.append(sub)
+
+        return children
 
     def build_bm25(self, chunks: list[Chunk],
                    label: str = "corpus") -> bm25s.BM25:
