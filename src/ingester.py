@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import shutil
+from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Generator, Optional
 import bm25s
@@ -240,6 +241,41 @@ def chunk_python_file(file_path: str, content: str,
                 chunk_type="code",
                 symbols=symbols,
             ))
+        elif isinstance(node, ast.ClassDef):
+            class_sig = node_text.split("\n")[0]
+            method_covered: list[tuple[int, int]] = []
+
+            for child in ast.iter_child_nodes(node):
+                if not isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    continue
+                c_first, c_last = node_char_range(child)
+                method_text = content[c_first:c_last]
+                method_symbols = extract_symbols(child)
+                method_covered.append((c_first, c_last))
+                enriched = class_sig + "\n    ...\n" + method_text.strip()
+
+                if len(enriched) <= max_chunk_size:
+                    chunks.append(Chunk(
+                        text=enriched,
+                        file_path=file_path,
+                        first_character_index=c_first,
+                        last_character_index=c_last,
+                        chunk_type="code",
+                        symbols=method_symbols,
+                    ))
+                else:
+                    chunks.extend(split_by_size(
+                        enriched, file_path, "code",
+                        max_chunk_size, c_first, method_symbols,
+                    ))
+
+            if not method_covered:
+                chunks.extend(split_by_size(
+                    node_text, file_path, "code",
+                    max_chunk_size, first, symbols,
+                ))
         else:
             chunks.extend(
                 split_by_size(
@@ -274,16 +310,6 @@ def chunk_python_file(file_path: str, content: str,
 def chunk_doc_file(file_path: str, content: str,
                    max_chunk_size: int = DEFAULT_DOC_CHUNK_SIZE
                    ) -> list[Chunk]:
-    """Chunk a Markdown or RST file by splitting on header lines.
-
-    Args:
-        file_path: Relative path used for chunk metadata.
-        content: Full text content of the file.
-        max_chunk_size: Maximum characters per chunk.
-
-    Returns:
-        List of Chunk objects.
-    """
     chunks: list[Chunk] = []
     lines = content.splitlines(keepends=True)
 
@@ -291,29 +317,98 @@ def chunk_doc_file(file_path: str, content: str,
     section_start_offset = 0
     char_offset = 0
 
+    # Stack index level
+    title_stack: list[str] = [""] * 7
+
+    def current_breadcrumb() -> str:
+        return " > ".join(t for t in title_stack if t)
+
+    def header_level(line: str) -> int:
+        count = 0
+        for ch in line:
+            if ch == "#":
+                count += 1
+            else:
+                break
+        return count if line.startswith("#") else 0
+
+    def is_table_line(line: str) -> bool:
+        return line.strip().startswith("|")
+
     def flush(end_offset: int) -> None:
-        section_text = "".join(section_lines).strip()
-        if not section_text:
+        if not section_lines:
             return
-        if len(section_text) <= max_chunk_size:
-            chunks.append(Chunk(
-                text=section_text,
-                file_path=file_path,
-                first_character_index=section_start_offset,
-                last_character_index=end_offset,
-                chunk_type="doc",
-            ))
-        else:
-            chunks.extend(split_by_size(
-                section_text, file_path, "doc",
-                max_chunk_size, section_start_offset,
-            ))
+
+        breadcrumb = current_breadcrumb()
+
+        blocks: list[tuple[str, bool]] = []
+        current_block: list[str] = []
+        current_is_table = is_table_line(section_lines[0])
+
+        for line in section_lines:
+            line_is_table = is_table_line(line)
+            if line_is_table != current_is_table:
+                if current_block:
+                    blocks.append(("".join(current_block), current_is_table))
+                current_block = [line]
+                current_is_table = line_is_table
+            else:
+                current_block.append(line)
+        if current_block:
+            blocks.append(("".join(current_block), current_is_table))
+
+        block_offset = section_start_offset
+        for block_text, is_table in blocks:
+            block_stripped = block_text.strip()
+            if not block_stripped:
+                block_offset += len(block_text)
+                continue
+
+            block_end = block_offset + len(block_text)
+
+            if is_table:
+                full_text = (
+                    breadcrumb + "\n" + block_stripped
+                    if breadcrumb else block_stripped
+                )
+                chunks.append(Chunk(
+                    text=full_text,
+                    file_path=file_path,
+                    first_character_index=block_offset,
+                    last_character_index=block_end,
+                    chunk_type="doc",
+                ))
+            else:
+                prefixed = (
+                    breadcrumb + "\n" + block_stripped
+                    if breadcrumb else block_stripped
+                )
+                if len(prefixed) <= max_chunk_size:
+                    chunks.append(Chunk(
+                        text=prefixed,
+                        file_path=file_path,
+                        first_character_index=block_offset,
+                        last_character_index=block_end,
+                        chunk_type="doc",
+                    ))
+                else:
+                    chunks.extend(split_by_size(
+                        prefixed, file_path, "doc",
+                        max_chunk_size, block_offset,
+                    ))
+
+            block_offset += len(block_text)
 
     for line in lines:
-        if line.startswith("#") and section_lines:
+        level = header_level(line)
+        if level > 0 and section_lines:
             flush(char_offset)
             section_lines = []
             section_start_offset = char_offset
+            # Actualize the stack
+            title_stack[level] = line.strip()
+            for i in range(level + 1, 7):
+                title_stack[i] = ""
         section_lines.append(line)
         char_offset += len(line)
 
@@ -403,9 +498,8 @@ class Ingester:
         """
 
         self.parent_chunks = self.collect_chunks(
-            code_size = self.code_chunk_size,
-            doc_size=self.doc_chunk_size
-        )
+            code_size=self.code_chunk_size,
+            doc_size=self.doc_chunk_size)
         self.chunks = self.collect_child_chunks()
         self.bm25 = self.build_bm25(self.chunks)
 
@@ -476,9 +570,8 @@ class Ingester:
         ingester.doc_chunk_size = DEFAULT_DOC_CHUNK_SIZE
 
         chunks_dir = os.path.join(processed_dir, "chunks")
-        with open(
-            os.path.join(chunks_dir, cls.CHUNKS_FILE),
-            "r", encoding="utf-8") as fh:
+        with open(os.path.join(chunks_dir, cls.CHUNKS_FILE),
+                  "r", encoding="utf-8") as fh:
             ingester.chunks = [Chunk.from_dict(d) for d in json.load(fh)]
 
         parent_path = os.path.join(chunks_dir, cls.PARENT_CHUNKS_FILE)
@@ -546,16 +639,8 @@ class Ingester:
             all_chunks.extend(file_chunks)
 
         return all_chunks
-    
+
     def collect_child_chunks(self) -> list[Chunk]:
-        """Generate small child chunks mapped to their parent chunks.
-
-        Each child has parent_id pointing to its parent in self.parent_chunks.
-        Children are used for BM25 retrieval; parents are passed to the LLM.
-
-        Returns:
-            Flat list of child Chunk objects with parent_id set.
-        """
         children: list[Chunk] = []
 
         for parent_idx, parent in enumerate(self.parent_chunks):
@@ -577,6 +662,17 @@ class Ingester:
                 )
                 children.append(child)
             else:
+                # Detectar si el padre es una tabla
+                first_line = parent.text.split("\n")[0] if parent.text else ""
+                is_table = first_line.strip().startswith("|")
+                
+                # Extraer header de tabla (primeras 2 líneas: headers + separador)
+                table_header = ""
+                if is_table:
+                    table_lines = parent.text.split("\n")
+                    header_lines = [line for line in table_lines[:3] if line.strip().startswith("|")]
+                    table_header = "\n".join(header_lines) + "\n" if header_lines else ""
+
                 sub_chunks = split_by_size(
                     parent.text,
                     parent.file_path,
@@ -585,7 +681,10 @@ class Ingester:
                     parent.first_character_index,
                     parent.symbols,
                 )
-                for sub in sub_chunks:
+                for i, sub in enumerate(sub_chunks):
+                    # Añadir header de tabla a los hijos que no son el primero
+                    if is_table and i > 0 and table_header:
+                        sub.text = table_header + sub.text
                     sub.parent_id = parent_idx
                     children.append(sub)
 
@@ -605,7 +704,8 @@ class Ingester:
         Returns:
             A fitted bm25s.BM25 instance.
         """
-        corpus = [c.text for c in chunks]
+        corpus = [self.processed(str(Path(c.file_path).with_suffix("")))
+                  + " " + c.text for c in chunks]
         print(f"Tokenizing {label} ({len(corpus)} chunks)...")
         tokenized = bm25s.tokenize(
             corpus, stopwords="en", show_progress=True
@@ -641,3 +741,21 @@ class Ingester:
             normalize_embeddings=True,
         )
         return embeddings
+
+    @staticmethod
+    def processed(text: str) -> str:
+        """Normalise text for BM25 indexing.
+
+        Lowercases, replaces underscores and hyphens with spaces,
+        and collapses whitespace.
+
+        Args:
+            text: Raw text to normalise.
+
+        Returns:
+            Normalised string.
+        """
+        text = text.lower()
+        text = text.replace("_", " ")
+        text = text.replace("-", " ")
+        return " ".join(text.split())

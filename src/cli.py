@@ -297,10 +297,9 @@ class CLI:
         except Exception:
             return
 
-        generator = None
         if not skip_generation:
             try:
-                generator = self.get_generator()
+                self.generator = self.get_generator()
             except Exception:
                 return
 

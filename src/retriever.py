@@ -107,22 +107,22 @@ class Retriever:
         self.embeddings = embeddings
         self.embed_model = None
         self.reranker = None
-        
+
         self.chunk_map: dict = {}
         self.parent_chunk_map: dict = {}
         self.parent_chunks: list[Chunk] = []
-        
+
         if embeddings is not None:
             self.load_embed_model()
-
 
     def rerank_batch(self, queries: list[str],
                      sources_list: list[list[MinimalSource]],
                      k: int) -> list[list[MinimalSource]]:
         """Rerank candidates for multiple queries in a single batch call.
 
-        More efficient than calling rerank() per query because the cross-encoder
-        processes all pairs in one forward pass instead of N separate calls.
+        More efficient than calling rerank() per query because the
+        cross-encoder processes all pairs in one forward pass instead
+        of N separate calls.
 
         Args:
             queries: List of original search strings.
@@ -168,14 +168,16 @@ class Retriever:
         return results
 
     def get_chunk_map(self) -> dict:
-        """Return cached chunk map for fast lookup by (file_path, first_char)."""
+        """
+        Return cached chunk map for fast lookup by (file_path, first_char).
+        """
         if not self.chunk_map:
             self.chunk_map = {
                 (c.file_path, c.first_character_index): c
                 for c in self.chunks
             }
         return self.chunk_map
-    
+
     def get_parent_chunk_map(self) -> dict:
         """Return cached parent chunk map for fast lookup."""
         if not self.parent_chunk_map:
@@ -258,7 +260,7 @@ class Retriever:
         if self.embeddings is not None and self.embed_model is not None:
             return self.search_hybrid(expanded, k)
         return self.search_bm25(expanded, k, min_score=0.0)
-    
+
     def get_top_bm25_score(self, query: str) -> float:
         """Return the highest BM25 score for a query over the corpus.
 
@@ -278,7 +280,7 @@ class Retriever:
             return float(scores[0][0])
         except Exception:
             return 0.0
-        
+
     def rerank_parents(self, query: str,
                        sources: list[MinimalSource],
                        k: int) -> list[MinimalSource]:
@@ -342,7 +344,8 @@ class Retriever:
         if self.embeddings is not None and self.embed_model is not None:
             child_candidates = self.search_hybrid(expanded, fetch_k)
         else:
-            child_candidates = self.search_bm25(expanded, fetch_k, min_score=0.0)
+            child_candidates = self.search_bm25(expanded, fetch_k,
+                                                min_score=0.0)
 
         # Map children to parents, deduplicate
         parent_map = self.get_chunk_map()
@@ -519,7 +522,7 @@ class Retriever:
             first_character_index=chunk.first_character_index,
             last_character_index=chunk.last_character_index,
         )
-    
+
     def child_to_parent_source(self, child: Chunk) -> MinimalSource:
         """Map a child chunk to its parent's MinimalSource.
 
@@ -537,4 +540,3 @@ class Retriever:
                 first_character_index=parent.first_character_index,
                 last_character_index=parent.last_character_index)
         return self.chunk_to_source(child)
-
