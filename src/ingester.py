@@ -371,13 +371,19 @@ def chunk_doc_file(file_path: str, content: str,
                     breadcrumb + "\n" + block_stripped
                     if breadcrumb else block_stripped
                 )
-                chunks.append(Chunk(
-                    text=full_text,
-                    file_path=file_path,
-                    first_character_index=block_offset,
-                    last_character_index=block_end,
-                    chunk_type="doc",
-                ))
+                if len(full_text) <= max_chunk_size:
+                    chunks.append(Chunk(
+                        text=full_text,
+                        file_path=file_path,
+                        first_character_index=block_offset,
+                        last_character_index=block_end,
+                        chunk_type="doc",
+                    ))
+                else:
+                    chunks.extend(split_by_size(
+                        full_text, file_path, "doc",
+                        max_chunk_size, block_offset,
+                    ))
             else:
                 prefixed = (
                     breadcrumb + "\n" + block_stripped
@@ -662,16 +668,18 @@ class Ingester:
                 )
                 children.append(child)
             else:
-                # Detectar si el padre es una tabla
+                # Is the parent a table?
                 first_line = parent.text.split("\n")[0] if parent.text else ""
                 is_table = first_line.strip().startswith("|")
-                
-                # Extraer header de tabla (primeras 2 líneas: headers + separador)
+
+                # Table Header Extract
                 table_header = ""
                 if is_table:
                     table_lines = parent.text.split("\n")
-                    header_lines = [line for line in table_lines[:3] if line.strip().startswith("|")]
-                    table_header = "\n".join(header_lines) + "\n" if header_lines else ""
+                    header_lines = [line for line in table_lines[:3]
+                                    if line.strip().startswith("|")]
+                    table_header = ("\n".join(header_lines) + "\n"
+                                    if header_lines else "")
 
                 sub_chunks = split_by_size(
                     parent.text,
@@ -682,7 +690,7 @@ class Ingester:
                     parent.symbols,
                 )
                 for i, sub in enumerate(sub_chunks):
-                    # Añadir header de tabla a los hijos que no son el primero
+                    # Add table header to sons
                     if is_table and i > 0 and table_header:
                         sub.text = table_header + sub.text
                     sub.parent_id = parent_idx

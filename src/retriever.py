@@ -350,7 +350,9 @@ class Retriever:
         # Map children to parents, deduplicate
         parent_map = self.get_chunk_map()
         seen: set = set()
-        parent_sources: list[MinimalSource] = []
+        doc_sources: list[MinimalSource] = []
+        code_sources: list[MinimalSource] = []
+
         for source in child_candidates:
             child = parent_map.get(
                 (source.file_path, source.first_character_index)
@@ -362,7 +364,30 @@ class Retriever:
                    parent_source.first_character_index)
             if key not in seen:
                 seen.add(key)
-                parent_sources.append(parent_source)
+                if child.chunk_type == "doc":
+                    doc_sources.append(parent_source)
+                else:
+                    code_sources.append(parent_source)
+
+        # Doc boost — buscar más docs en el índice general y añadirlos al pool
+        extra_doc_candidates = self.search_bm25(expanded,
+                                                k * 5,
+                                                min_score=0.0)
+        for source in extra_doc_candidates:
+            child = parent_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if child is None or child.chunk_type != "doc":
+                continue
+            parent_source = self.child_to_parent_source(child)
+            key = (parent_source.file_path,
+                   parent_source.first_character_index)
+            if key not in seen:
+                seen.add(key)
+                doc_sources.append(parent_source)
+
+        # Docs primero — reranker los ve garantizados
+        parent_sources = doc_sources + code_sources
 
         # Rerank over parent text
         return self.rerank_parents(query, parent_sources, k)
