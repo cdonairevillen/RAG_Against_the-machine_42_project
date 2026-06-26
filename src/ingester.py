@@ -15,7 +15,7 @@ INCLUDE_EXTENSIONS = {".py", ".pyi", ".md", ".rst", ".txt"}
 EXCLUDE_DIRS = {
     "csrc", ".buildkite", ".github", "cmake",
     "docker", ".gemini", "requirements", "__pycache__",
-    ".git", "node_modules",
+    ".git", "node_modules", "tests", "examples"
 }
 
 CODE_EXTENSIONS = {".py", ".pyi"}
@@ -316,30 +316,16 @@ def chunk_doc_file(file_path: str, content: str,
     section_lines: list[str] = []
     section_start_offset = 0
     char_offset = 0
-
-    # Stack index level
-    title_stack: list[str] = [""] * 7
-
-    def current_breadcrumb() -> str:
-        return " > ".join(t for t in title_stack if t)
-
-    def header_level(line: str) -> int:
-        count = 0
-        for ch in line:
-            if ch == "#":
-                count += 1
-            else:
-                break
-        return count if line.startswith("#") else 0
+    section_title: str = ""
+    MIN_SECTION_SIZE = 200
 
     def is_table_line(line: str) -> bool:
         return line.strip().startswith("|")
 
     def flush(end_offset: int) -> None:
-        if not section_lines:
+        section_text = "".join(section_lines).strip()
+        if not section_text:
             return
-
-        breadcrumb = current_breadcrumb()
 
         blocks: list[tuple[str, bool]] = []
         current_block: list[str] = []
@@ -368,8 +354,8 @@ def chunk_doc_file(file_path: str, content: str,
 
             if is_table:
                 full_text = (
-                    breadcrumb + "\n" + block_stripped
-                    if breadcrumb else block_stripped
+                    section_title + "\n" + block_stripped
+                    if section_title else block_stripped
                 )
                 if len(full_text) <= max_chunk_size:
                     chunks.append(Chunk(
@@ -385,13 +371,9 @@ def chunk_doc_file(file_path: str, content: str,
                         max_chunk_size, block_offset,
                     ))
             else:
-                prefixed = (
-                    breadcrumb + "\n" + block_stripped
-                    if breadcrumb else block_stripped
-                )
-                if len(prefixed) <= max_chunk_size:
+                if len(block_stripped) <= max_chunk_size:
                     chunks.append(Chunk(
-                        text=prefixed,
+                        text=block_stripped,
                         file_path=file_path,
                         first_character_index=block_offset,
                         last_character_index=block_end,
@@ -399,24 +381,58 @@ def chunk_doc_file(file_path: str, content: str,
                     ))
                 else:
                     chunks.extend(split_by_size(
-                        prefixed, file_path, "doc",
+                        block_stripped, file_path, "doc",
                         max_chunk_size, block_offset,
                     ))
 
             block_offset += len(block_text)
 
+    pending_lines: list[str] = []
+    pending_start_offset: int = 0
+    pending_title: str = ""
+
     for line in lines:
-        level = header_level(line)
-        if level > 0 and section_lines:
-            flush(char_offset)
-            section_lines = []
-            section_start_offset = char_offset
-            # Actualize the stack
-            title_stack[level] = line.strip()
-            for i in range(level + 1, 7):
-                title_stack[i] = ""
+        if line.startswith("#") and section_lines:
+            section_text = "".join(section_lines).strip()
+            if len(section_text) < MIN_SECTION_SIZE:
+                # Acumular sección pequeña
+                if not pending_lines:
+                    pending_start_offset = section_start_offset
+                    pending_title = section_title
+                pending_lines.extend(section_lines)
+            else:
+                # Fusionar pendientes con sección actual si caben
+                if pending_lines:
+                    combined = "".join(pending_lines) + "".join(section_lines)
+                    if len(combined.strip()) <= max_chunk_size:
+                        section_lines = pending_lines + section_lines
+                        section_start_offset = pending_start_offset
+                        section_title = pending_title
+                    else:
+                        # Flushear pendientes primero
+                        old_lines = section_lines
+                        old_start = section_start_offset
+                        old_title = section_title
+                        section_lines = pending_lines
+                        section_start_offset = pending_start_offset
+                        section_title = pending_title
+                        flush(char_offset)
+                        section_lines = old_lines
+                        section_start_offset = old_start
+                        section_title = old_title
+                    pending_lines = []
+                flush(char_offset)
+                section_lines = []
+                section_start_offset = char_offset
+                section_title = line.strip()
         section_lines.append(line)
         char_offset += len(line)
+
+    # Fusionar pendientes finales con última sección
+    if pending_lines:
+        section_lines = pending_lines + section_lines
+        section_start_offset = pending_start_offset
+        section_title = pending_title
 
     flush(char_offset)
     return chunks

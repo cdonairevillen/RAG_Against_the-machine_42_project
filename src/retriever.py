@@ -4,6 +4,7 @@ import bm25s
 import numpy as np
 from src.ingester import Chunk, Ingester
 from src.models import MinimalSource
+from pathlib import Path
 
 RRF_K = 60
 
@@ -229,6 +230,83 @@ class Retriever:
         except Exception:
             return 0.0
 
+    def search_smart(self, query: str, k: int = 10) -> list[MinimalSource]:
+        """BM25 para docs, reranker para code."""
+        if not query or not query.strip() or k <= 0:
+            return []
+
+        expanded = expand_query(query, self.chunks)
+        fetch_k = min(k * 5, len(self.chunks))
+        child_candidates = self.search_bm25(expanded, fetch_k, min_score=0.0)
+
+        parent_map = self.get_chunk_map()
+        seen: set = set()
+        doc_sources: list[MinimalSource] = []
+        code_sources: list[MinimalSource] = []
+
+        for source in child_candidates:
+            child = parent_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if child is None:
+                continue
+            parent_source = self.child_to_parent_source(child)
+            key = (parent_source.file_path,
+                   parent_source.first_character_index)
+            if key not in seen:
+                seen.add(key)
+                if child.chunk_type == "doc":
+                    doc_sources.append(parent_source)
+                else:
+                    code_sources.append(parent_source)
+
+        # Docs: BM25 order (no reranker)
+        # Code: reranker
+        if self.reranker is not None and code_sources:
+            top_code = self.rerank_parents(query, code_sources, k)
+        else:
+            top_code = code_sources[:k]
+
+        # Garantizar representación de ambos tipos
+        # Ajustar doc_slots según lo que BM25 encontró naturalmente
+        natural_docs = len(doc_sources)
+        if natural_docs == 0:
+            doc_slots = 0
+        elif natural_docs <= 2:
+            doc_slots = natural_docs  # no forzar más de lo que hay
+        else:
+            doc_slots = min(3, natural_docs)
+
+        code_slots = k - doc_slots
+
+        result: list[MinimalSource] = []
+        seen_result: set = set()
+
+        # Primero los mejores docs (BM25 order)
+        for src in doc_sources[:doc_slots]:
+            key = (src.file_path, src.first_character_index)
+            if key not in seen_result:
+                result.append(src)
+                seen_result.add(key)
+
+        # Luego el mejor código (reranked)
+        for src in top_code[:code_slots]:
+            key = (src.file_path, src.first_character_index)
+            if key not in seen_result:
+                result.append(src)
+                seen_result.add(key)
+
+        # Rellenar si faltan slots
+        for src in doc_sources[doc_slots:] + top_code[code_slots:]:
+            if len(result) >= k:
+                break
+            key = (src.file_path, src.first_character_index)
+            if key not in seen_result:
+                result.append(src)
+                seen_result.add(key)
+
+        return result[:k]
+
     def rerank_parents(self, query: str,
                        sources: list[MinimalSource],
                        k: int) -> list[MinimalSource]:
@@ -317,28 +395,40 @@ class Retriever:
                 else:
                     code_sources.append(parent_source)
 
-        # Doc boost — buscar más docs en el índice general y añadirlos al pool
-        extra_doc_candidates = self.search_bm25(expanded,
-                                                k * 5,
-                                                min_score=0.0)
-        for source in extra_doc_candidates:
-            child = parent_map.get(
-                (source.file_path, source.first_character_index)
-            )
-            if child is None or child.chunk_type != "doc":
-                continue
-            parent_source = self.child_to_parent_source(child)
-            key = (parent_source.file_path,
-                   parent_source.first_character_index)
-            if key not in seen:
-                seen.add(key)
-                doc_sources.append(parent_source)
+        # Rerank todo junto pero garantizando docs al frente
+        all_sources = doc_sources + code_sources
+        reranked = self.rerank_parents(query, all_sources, k +
+                                       min(2, len(doc_sources)))
 
-        # Docs primero — reranker los ve garantizados
-        parent_sources = doc_sources + code_sources
+        # Garantizar al menos 2 docs en el resultado final
+        result: list[MinimalSource] = []
+        seen_result: set = set()
+        min_docs = min(2, len(doc_sources))
 
-        # Rerank over parent text
-        return self.rerank_parents(query, parent_sources, k)
+        # Primero añadir docs del reranked
+        for src in reranked:
+            key = (src.file_path, src.first_character_index)
+            if key not in seen_result:
+                parent = self.get_parent_chunk_map().get(key)
+                if parent and any(
+                    (d.file_path, d.first_character_index) == key
+                    for d in doc_sources
+                ):
+                    result.append(src)
+                    seen_result.add(key)
+                    if len(result) >= min_docs:
+                        break
+
+        # Rellenar con el resto del reranked
+        for src in reranked:
+            key = (src.file_path, src.first_character_index)
+            if key not in seen_result:
+                result.append(src)
+                seen_result.add(key)
+            if len(result) >= k:
+                break
+
+        return result[:k]
 
     def search_bm25(self, query: str, k: int,
                     min_score: float = 0.0) -> list[MinimalSource]:

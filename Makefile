@@ -117,24 +117,24 @@ meme:
 
 test-docs:
 	$(ENV) uv run --project . python3 -m src search_dataset \
-		--dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json \
+		--dataset_path data/datasets/private/UnansweredQuestions/dataset_docs_private.json \
 		--save_directory data/output/search_results
 
 test-eval-docs:
 	$(ENV) uv run --project . python3 -m src evaluate \
-		--student_answer_path data/output/search_results/dataset_docs_public.json \
-		--dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json \
+		--student_answer_path data/output/search_results/dataset_docs_private.json \
+		--dataset_path data/datasets/private/AnsweredQuestions/dataset_docs_private.json \
 		--k 10
 
 test-code:
 	$(ENV) uv run --project . python3 -m src search_dataset \
-		--dataset_path data/datasets/UnansweredQuestions/dataset_code_public.json \
+		--dataset_path data/datasets/private/UnansweredQuestions/dataset_code_private.json \
 		--save_directory data/output/search_results
 
 test-eval-code:
 	$(ENV) uv run --project . python3 -m src evaluate \
-		--student_answer_path data/output/search_results/dataset_code_public.json \
-		--dataset_path data/datasets/AnsweredQuestions/dataset_code_public.json \
+		--student_answer_path data/output/search_results/dataset_code_private.json \
+		--dataset_path data/datasets/private/AnsweredQuestions/dataset_code_private.json \
 		--k 10
 
 .PHONY: install run web web-stop index index-fast search-docs search-code \
