@@ -115,58 +115,6 @@ class Retriever:
         if embeddings is not None:
             self.load_embed_model()
 
-    def rerank_batch(self, queries: list[str],
-                     sources_list: list[list[MinimalSource]],
-                     k: int) -> list[list[MinimalSource]]:
-        """Rerank candidates for multiple queries in a single batch call.
-
-        More efficient than calling rerank() per query because the
-        cross-encoder processes all pairs in one forward pass instead
-        of N separate calls.
-
-        Args:
-            queries: List of original search strings.
-            sources_list: Parallel list of candidate MinimalSource lists.
-            k: Number of top results to return per query.
-
-        Returns:
-            List of reranked MinimalSource lists, one per query.
-        """
-        if self.reranker is None:
-            return [s[:k] for s in sources_list]
-
-        chunk_map = self.get_chunk_map()
-        all_pairs: list[tuple[str, str]] = []
-        offsets: list[int] = [0]
-
-        for query, sources in zip(queries, sources_list):
-            for source in sources:
-                chunk = chunk_map.get(
-                    (source.file_path, source.first_character_index)
-                )
-                text = chunk.text if chunk else source.file_path
-                all_pairs.append((query, text))
-            offsets.append(len(all_pairs))
-
-        if not all_pairs:
-            return [s[:k] for s in sources_list]
-
-        all_scores: list[float] = self.reranker.predict(
-            all_pairs, show_progress_bar=True).tolist()
-
-        results: list[list[MinimalSource]] = []
-        for i, sources in enumerate(sources_list):
-            start, end = offsets[i], offsets[i + 1]
-            query_scores = all_scores[start:end]
-            ranked = sorted(
-                zip(query_scores, sources),
-                key=lambda x: x[0],
-                reverse=True
-            )
-            results.append([s for _, s in ranked[:k]])
-
-        return results
-
     def get_chunk_map(self) -> dict:
         """
         Return cached chunk map for fast lookup by (file_path, first_char).
@@ -331,7 +279,7 @@ class Retriever:
         if not query or not query.strip() or k <= 0:
             return []
 
-        if self.get_top_bm25_score(query) < 4.5:
+        if self.get_top_bm25_score(query) < 5.5:
             return []
 
         if self.reranker is None:
@@ -453,40 +401,6 @@ class Retriever:
             self.chunk_to_source(self.chunks[idx])
             for idx, _ in ranked[:k]
         ]
-
-    def rerank(self, query: str, sources: list[MinimalSource],
-               k: int) -> list[MinimalSource]:
-        """Rerank candidates using a cross-encoder for precision.
-
-        The cross-encoder scores each (query, chunk_text) pair jointly,
-        producing a relevance score more accurate than BM25 alone.
-
-        Args:
-            query: The original search string (not expanded).
-            sources: Candidate MinimalSource objects to rerank.
-            k: Number of top results to return after reranking.
-
-        Returns:
-            Reranked and truncated MinimalSource list.
-        """
-        if self.reranker is None or not sources:
-            return sources[:k]
-
-        chunk_map = self.get_chunk_map()
-
-        pairs: list[tuple[str, str]] = []
-        for source in sources:
-            chunk = chunk_map.get(
-                (source.file_path, source.first_character_index)
-            )
-            text = chunk.text if chunk else source.file_path
-            pairs.append((query, text))
-
-        scores: list[float] = self.reranker.predict(pairs).tolist()
-        ranked = sorted(
-            zip(scores, sources), key=lambda x: x[0], reverse=True
-        )
-        return [source for _, source in ranked[:k]]
 
     def retrieve_from_bm25(self, query: str, k: int) -> list[int]:
         """Run a BM25 query and return chunk indices.

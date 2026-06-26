@@ -184,7 +184,7 @@ class CLI:
                        ) -> None:
         """Run fast retrieval over every question in a dataset JSON.
 
-        Uses BM25-only search without reranker for evaluation throughput.
+        Uses BM25-only search with reranker for evaluation throughput.
 
         Args:
             dataset_path: Path to a RagDataset JSON.
@@ -244,9 +244,19 @@ class CLI:
             print("No relevant sources found.")
             return
 
+        parent_map = retriever.get_parent_chunk_map()
+        context_blocks = []
+        for src in sources:
+            parent = parent_map.get(
+                (src.file_path, src.first_character_index)
+            )
+            if parent:
+                context_blocks.append(
+                    f"--- file: {src.file_path} ---\n{parent.text}"
+                )
         try:
             generator = self.get_generator()
-            response = generator.answer(query, sources)
+            response = generator.answer_with_text(query, context_blocks)
         except Exception as exc:
             print(f"Error during generation: {exc}")
             return
@@ -255,7 +265,13 @@ class CLI:
         print("=== Answer ===")
         print(response)
 
-        not_found = "Not found in the provided sources" in response
+        not_found_phrases = [
+            "not found in the provided sources",
+            "provided sources do not contain",
+            "no relevant information",
+            "i've not found",
+        ]
+        not_found = any(p in response.lower() for p in not_found_phrases)
         if not not_found:
             print("\n=== Sources ===")
             for i, src in enumerate(sources):

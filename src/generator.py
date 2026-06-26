@@ -9,28 +9,19 @@ def build_prompt(question: str, context_blocks: list[str]) -> str:
     """Assemble prompt using Qwen3 chat format with thinking disabled."""
     context_section = "\n\n".join(context_blocks)
     system = (
-        "You are a read-only technical documentation assistant for the "
-        "vLLM codebase. Your only job is to answer questions using the "
-        "SOURCE CODE AND DOCUMENTATION provided below.\n\n"
-        "STRICT RULES — follow all of them:\n"
-        "1. Use ONLY information explicitly stated in the context. "
-        "Never infer, guess, or complete missing information.\n"
-        "2. If the context contains a function definition or template "
-        "string, do NOT simulate calling it or filling its placeholders. "
-        "Code is not data.\n"
-        "3. If the context contains example or test code with hardcoded "
-        "values, do NOT treat those values as real facts.\n"
-        "4. If the answer is not EXPLICITLY AND DIRECTLY stated in the"
-        " context, respond ONLY with: 'Not found in the provided sources.' "
-        "Partial or related information is not enough — only direct answers.\n"
-        "5. Never use your training knowledge. If you know the answer "
-        "but it is not in the context, respond ONLY with: "
-        "'Not found in the provided sources.'\n"
-        "6. Keep your answer concise. If you found the answer, always "
-        "cite the source file at the end.\n\n"
-        "FORMAT when answer IS found: direct answer + 'Source: <filenames>'\n"
-        "FORMAT when answer IS NOT found:"
-        " 'Not found in the provided sources.'\n"
+            "You are a technical assistant for the vLLM codebase. "
+            "Answer using ONLY the CONTEXT provided. No prior knowledge.\n\n"
+            "RULES:\n"
+            "1. If the answer is in the CONTEXT: give a direct answer and end with "
+            "'Source: <filename>'.\n"
+            "2. If the answer is NOT in the CONTEXT: respond with exactly "
+            "'Not found in the provided sources.' Nothing else.\n"
+            "3. Do not infer, guess, or add information not in the CONTEXT.\n\n"
+            "EXAMPLES:\n"
+            "Q: What does X do?\n"
+            "A: X does Y. Source: vllm/x.py\n\n"
+            "Q: What is the capital of France?\n"
+            "A: Not found in the provided sources.\n"
         )
     user_content = (
         f"CONTEXT:\n{context_section}\n\nQUESTION: {question} /no_think"
@@ -185,6 +176,26 @@ class Generator:
         budget = max_chars - len(tail)
         return prompt[:budget] + "\n[context truncated]\n" + tail
 
+    def answer_with_text(self, question: str,
+                         context_blocks: list[str]) -> str:
+        """Generate answer with pre-built context blocks.
+
+        Args:
+            question: The natural-language question.
+            context_blocks: Pre-built context strings.
+
+        Returns:
+            A concise, source-grounded answer string.
+        """
+        if not question or not question.strip():
+            return "No question provided."
+        if not context_blocks:
+            return "No relevant sources found."
+
+        prompt = build_prompt(question, context_blocks)
+        prompt = self.truncate_prompt(prompt)
+        return self.greedy_decode(prompt)
+
     def greedy_decode(self, prompt: str) -> str:
         """Generate text using HuggingFace's native generate() with KV-cache.
 
@@ -218,4 +229,18 @@ class Generator:
 
         # Strip thinking block
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        return text.strip()
+        text = text.strip()
+        not_found_patterns = [
+            r"not found in the provided sources",
+            r"i've not found",
+            r"i have not found",
+            r"the provided sources do not contain",
+            r"there is no information",
+            r"no relevant information",
+            ]
+        text_lower = text.lower()
+        for pattern in not_found_patterns:
+            if re.search(pattern, text_lower):
+                return "Not found in the provided sources."
+
+        return text

@@ -477,9 +477,20 @@ def main() -> None:
                     unsafe_allow_html=True
                 )
             else:
-                # Generate
+                # Generate — usar parent_chunks en memoria como en CLI
+                parent_map = retriever.get_parent_chunk_map()
+                context_blocks = []
+                for src in sources:
+                    parent = parent_map.get(
+                        (src.file_path, src.first_character_index)
+                    )
+                    if parent:
+                        context_blocks.append(
+                            f"--- file: {src.file_path} ---\n{parent.text}"
+                        )
+
                 with st.spinner("Generating answer..."):
-                    answer = generator.answer(query, sources)
+                    answer = generator.answer_with_text(query, context_blocks)
 
                 if not answer or answer.strip() in (
                     "No question provided.",
@@ -502,33 +513,24 @@ def main() -> None:
                 )
 
                 # Sources
-                not_found = "Not found in the provided sources" in answer
+                not_found_phrases = [
+                    "not found in the provided sources",
+                    "provided sources do not contain",
+                    "no relevant information",
+                    "i've not found",
+                ]
+                not_found = any(p in answer.lower() for p in not_found_phrases)
+
                 if not not_found:
                     st.markdown(
                         '<div class="section-label">Sources</div>',
                         unsafe_allow_html=True
                     )
                     for i, source in enumerate(sources, 1):
-                        # Read chunk text for preview
-                        text_preview = ""
-                        abs_path = os.path.join(
-                            REPO_ROOT, source.file_path
+                        parent = parent_map.get(
+                            (source.file_path, source.first_character_index)
                         )
-                        if not os.path.isfile(abs_path):
-                            abs_path = source.file_path
-                        if os.path.isfile(abs_path):
-                            try:
-                                with open(
-                                    abs_path, "r",
-                                    encoding="utf-8", errors="ignore"
-                                ) as fh:
-                                    content = fh.read()
-                                text_preview = content[
-                                    source.first_character_index:
-                                    source.last_character_index
-                                ]
-                            except (OSError, IndexError):
-                                pass
+                        text_preview = parent.text if parent else ""
 
                         render_source_card(
                             index=i,

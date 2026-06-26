@@ -495,7 +495,7 @@ class Ingester:
 
         self.embeddings: Optional[np.ndarray] = None
 
-    def build(self, use_embeddings: bool = True) -> None:
+    def build(self, use_embeddings: bool = False) -> None:
         """Ingest the repository and fit the BM25 index.
 
         Args:
