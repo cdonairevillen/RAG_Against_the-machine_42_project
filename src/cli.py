@@ -21,10 +21,6 @@ class CLI:
     Loads Retriever and Generator lazily on first use and reuses them
     for all subsequent calls within the same process.
 
-    Two retrieval modes are available:
-        search / search_dataset  — fast BM25-only, no reranker.
-        answer / answer_dataset  — BM25 + reranker before LLM generation.
-
     Commands:
         index           Build BM25 and optional embedding indices.
         search          Search for a single query (fast, no reranker).
@@ -38,47 +34,22 @@ class CLI:
         uv run python -m src search "How to configure OpenAI server?" --k 10
         uv run python -m src answer "How to configure OpenAI server?" --k 10
         uv run python -m src search_dataset \\
-            --dataset_path
-
-            data/datasets/UnansweredQuestions/dataset_docs_public.json
+    --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json
         uv run python -m src answer_dataset \\
-            --dataset_path
-
-            data/datasets/UnansweredQuestions/dataset_docs_public.json
+    --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json
         uv run python -m src evaluate \\
-            --student_answer_path
-
-            data/output/search_results/dataset_docs_public.json \\
-            --dataset_path
-
-            data/datasets/AnsweredQuestions/dataset_docs_public.json
+    --student_answer_path data/output/search_results/dataset_docs_public.json
+    --dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json
     """
 
     def __init__(self, processed_dir: str = PROCESSED_DIR,
                  repo_root: str = REPO_ROOT) -> None:
-        """Initialise the CLI orchestrator.
-
-        Args:
-            processed_dir: Directory containing chunks and BM25 index.
-            repo_root: Root of the vLLM repository (used by Generator).
-        """
         self.processed_dir = processed_dir
         self.repo_root = repo_root
         self.retriever: Retriever | None = None
         self.generator: Generator | None = None
 
     def get_retriever(self, with_reranker: bool = True) -> Retriever:
-        """Load and cache the Retriever.
-
-        Args:
-            with_reranker: When True, also loads the cross-encoder reranker.
-
-        Returns:
-            The loaded Retriever instance.
-
-        Raises:
-            Exception: Propagates any load error after printing a message.
-        """
         if self.retriever is None:
             try:
                 self.retriever = Retriever.from_disk(self.processed_dir)
@@ -93,14 +64,6 @@ class CLI:
         return self.retriever
 
     def get_generator(self) -> Generator:
-        """Load and cache the Generator.
-
-        Returns:
-            The loaded Generator instance.
-
-        Raises:
-            Exception: Propagates any model load error.
-        """
         if self.generator is None:
             try:
                 self.generator = Generator(repo_root=self.repo_root)
@@ -111,18 +74,9 @@ class CLI:
 
     def index(self, repo_root: str = REPO_ROOT,
               max_chunk_size: int = 2000,
-              code_chunk_size: int = 1200, doc_chunk_size: int = 2000,
+              code_chunk_size: int = 2000, doc_chunk_size: int = 2000,
               output_dir: str = PROCESSED_DIR,
               use_embeddings: bool = False) -> None:
-        """Ingest the vLLM repository and persist BM25 and embedding indices.
-
-        Args:
-            repo_root: Path to the vLLM repository root.
-            code_chunk_size: Maximum characters per code chunk.
-            doc_chunk_size: Maximum characters per doc chunk.
-            output_dir: Where chunks and indices are saved.
-            use_embeddings: Build semantic embedding index alongside BM25.
-        """
         from src.ingester import Ingester
 
         if max_chunk_size != 2000:
@@ -145,14 +99,6 @@ class CLI:
             print(f"Error during indexing: {exc}")
 
     def search(self, query: str, k: int = 10) -> None:
-        """Search the knowledge base for a single query and print results.
-
-        Uses fast BM25-only retrieval — no reranker.
-
-        Args:
-            query: Search string. Empty query exits cleanly.
-            k: Number of results to retrieve.
-        """
         if not query or not query.strip():
             print("Empty query — no results.")
             return
@@ -182,15 +128,14 @@ class CLI:
     def search_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/search_results"
                        ) -> None:
-        """Run fast retrieval over every question in a dataset JSON.
+        """Run dual BM25 retrieval over every question in a dataset JSON.
 
-        Uses BM25-only search with reranker for evaluation throughput.
+        Uses separate doc and code indices interleaved — no reranker.
 
         Args:
             dataset_path: Path to a RagDataset JSON.
             k: Chunks to retrieve per question.
-            save_directory: Where the StudentSearchResults JSON is
-            written.
+            save_directory: Where the StudentSearchResults JSON is written.
         """
         if not os.path.isfile(dataset_path):
             print(f"Error: dataset file not found: {dataset_path}")
@@ -208,8 +153,9 @@ class CLI:
 
         results: list[MinimalSearchResults] = []
         for question in tqdm(dataset.rag_questions, desc="Searching"):
-
-            sources = retriever.search_rrf(question.question, k=k)
+            sources = retriever.search_smart(question.question, k=k)
+            if sources is None:
+                sources = []
             results.append(MinimalSearchResults(
                 question_id=question.question_id,
                 question_str=question.question,
@@ -224,12 +170,6 @@ class CLI:
         )
 
     def answer(self, query: str, k: int = 10) -> None:
-        """Answer a single question using retrieved and reranked context.
-
-        Args:
-            query: Natural-language question.
-            k: Number of chunks to retrieve as context.
-        """
         if not query or not query.strip():
             print("Empty query — nothing to answer.")
             return
@@ -288,16 +228,6 @@ class CLI:
     def answer_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/answers",
                        skip_generation: bool = True) -> None:
-        """Full RAG pipeline over an entire dataset:
-        retrieve + rerank + generate.
-
-        Args:
-            dataset_path: Path to a RagDataset JSON.
-            k: Chunks to retrieve per question.
-            save_directory: Where the output JSON is written.
-            skip_generation: If True, saves retrieval results only.
-                Useful for measuring recall@k without the LLM.
-        """
         if not os.path.isfile(dataset_path):
             print(f"Error: dataset file not found: {dataset_path}")
             return
@@ -328,10 +258,41 @@ class CLI:
                 sources = retriever.search_for_generation(
                     question.question, k=k
                 )
+                if sources is None:
+                    sources = []
                 search_only.append(MinimalSearchResults(
                     question_id=question.question_id,
                     question_str=question.question,
                     retrieved_sources=sources,
+                ))
+        else:
+            parent_map = retriever.get_parent_chunk_map()
+            for question in tqdm(dataset.rag_questions, desc=desc):
+                sources = retriever.search_for_generation(
+                    question.question, k=k
+                )
+                if sources is None:
+                    sources = []
+                context_blocks = []
+                for src in sources:
+                    parent = parent_map.get(
+                        (src.file_path, src.first_character_index)
+                    )
+                    if parent:
+                        context_blocks.append(
+                            f"--- file: {src.file_path} ---\n{parent.text}"
+                        )
+                try:
+                    response = self.generator.answer_with_text(
+                        question.question, context_blocks
+                    )
+                except Exception:
+                    response = "Error generating answer."
+                answers.append(MinimalAnswer(
+                    question_id=question.question_id,
+                    question_str=question.question,
+                    retrieved_sources=sources,
+                    answer=response,
                 ))
 
         filename = os.path.basename(dataset_path)
@@ -354,14 +315,6 @@ class CLI:
 
     def evaluate(self, student_answer_path: str, dataset_path: str,
                  k: int = 10, max_context_length: int = 2000) -> None:
-        """Evaluate retrieval quality using Recall@k vs ground-truth sources.
-
-        Args:
-            student_answer_path: Path to StudentSearchResults JSON.
-            dataset_path: Path to the AnsweredQuestions RagDataset JSON.
-            k: Evaluate Recall@1, @3, @5 and @k.
-            max_context_length: Kept for moulinette CLI compatibility.
-        """
         from src.evaluator import Evaluator
 
         if not os.path.isfile(student_answer_path):
@@ -383,15 +336,6 @@ class CLI:
     @staticmethod
     def find_chunk(retriever: Retriever,
                    source: MinimalSource) -> Chunk | None:
-        """Find the Chunk object matching a MinimalSource.
-
-        Args:
-            retriever: The loaded Retriever instance.
-            source: MinimalSource to look up.
-
-        Returns:
-            Matching Chunk or None if not found.
-        """
         chunk_map = retriever.get_chunk_map()
         return chunk_map.get(
             (source.file_path, source.first_character_index))
@@ -399,14 +343,6 @@ class CLI:
     @staticmethod
     def save_json(model: BaseModel, directory: str,
                   filename: str, label: str) -> None:
-        """Serialize a Pydantic model to JSON and write it to disk.
-
-        Args:
-            model: Any Pydantic BaseModel with model_dump_json().
-            directory: Target directory (created if missing).
-            filename: Output filename.
-            label: Human-readable label for the success message.
-        """
         os.makedirs(directory, exist_ok=True)
         out_path = os.path.join(directory, filename)
         try:
