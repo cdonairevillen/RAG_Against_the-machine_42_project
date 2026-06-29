@@ -209,7 +209,7 @@ class CLI:
         results: list[MinimalSearchResults] = []
         for question in tqdm(dataset.rag_questions, desc="Searching"):
 
-            sources = retriever.search_smart(question.question, k=k)
+            sources = retriever.search_rrf(question.question, k=k)
             results.append(MinimalSearchResults(
                 question_id=question.question_id,
                 question_str=question.question,

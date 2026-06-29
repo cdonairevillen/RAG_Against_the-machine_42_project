@@ -4,7 +4,6 @@ import bm25s
 import numpy as np
 from src.ingester import Chunk, Ingester
 from src.models import MinimalSource
-from pathlib import Path
 
 RRF_K = 60
 
@@ -231,7 +230,7 @@ class Retriever:
             return 0.0
 
     def search_smart(self, query: str, k: int = 10) -> list[MinimalSource]:
-        """BM25 para docs, reranker para code."""
+        """BM25 order for docs, reranker for code, interleaved."""
         if not query or not query.strip() or k <= 0:
             return []
 
@@ -267,45 +266,88 @@ class Retriever:
         else:
             top_code = code_sources[:k]
 
-        # Garantizar representación de ambos tipos
-        # Ajustar doc_slots según lo que BM25 encontró naturalmente
-        natural_docs = len(doc_sources)
-        if natural_docs == 0:
-            doc_slots = 0
-        elif natural_docs <= 2:
-            doc_slots = natural_docs  # no forzar más de lo que hay
-        else:
-            doc_slots = min(3, natural_docs)
+        code_rank = {
+            (s.file_path, s.first_character_index): i
+            for i, s in enumerate(top_code)
+        }
 
-        code_slots = k - doc_slots
-
+        # BM25 order para docs, reranker filter para code
         result: list[MinimalSource] = []
         seen_result: set = set()
 
-        # Primero los mejores docs (BM25 order)
-        for src in doc_sources[:doc_slots]:
-            key = (src.file_path, src.first_character_index)
-            if key not in seen_result:
-                result.append(src)
-                seen_result.add(key)
-
-        # Luego el mejor código (reranked)
-        for src in top_code[:code_slots]:
-            key = (src.file_path, src.first_character_index)
-            if key not in seen_result:
-                result.append(src)
-                seen_result.add(key)
-
-        # Rellenar si faltan slots
-        for src in doc_sources[doc_slots:] + top_code[code_slots:]:
+        for source in child_candidates:
             if len(result) >= k:
                 break
-            key = (src.file_path, src.first_character_index)
-            if key not in seen_result:
-                result.append(src)
-                seen_result.add(key)
+            child = parent_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if child is None:
+                continue
+            parent_source = self.child_to_parent_source(child)
+            key = (parent_source.file_path,
+                   parent_source.first_character_index)
+            if key in seen_result:
+                continue
+            if child.chunk_type == "code" and key not in code_rank:
+                continue
+            seen_result.add(key)
+            result.append(parent_source)
 
         return result[:k]
+
+    def search_rrf(self, query: str, k: int = 10) -> list[MinimalSource]:
+        """Double BM25 with RRF fusion — no reranker needed.
+
+        Args:
+            query: Natural-language search string.
+            k: Number of results to return.
+
+        Returns:
+            RRF-fused list of parent MinimalSource objects.
+        """
+        if not query or not query.strip() or k <= 0:
+            return []
+
+        expanded = expand_query(query, self.chunks)
+        fetch_k = min(k * 5, len(self.chunks))
+
+        # Dos búsquedas BM25 independientes
+        candidates_expanded = self.search_bm25(expanded, fetch_k,
+                                               min_score=0.0)
+        candidates_original = self.search_bm25(query, fetch_k,
+                                               min_score=0.0)
+
+        # Mapear hijos a padres con scores RRF
+        parent_map = self.get_chunk_map()
+        rrf_scores: dict[tuple, float] = {}
+        parent_sources: dict[tuple, MinimalSource] = {}
+
+        for rank, source in enumerate(candidates_expanded):
+            child = parent_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if child is None:
+                continue
+            parent_source = self.child_to_parent_source(child)
+            key = (parent_source.file_path,
+                   parent_source.first_character_index)
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            parent_sources[key] = parent_source
+
+        for rank, source in enumerate(candidates_original):
+            child = parent_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if child is None:
+                continue
+            parent_source = self.child_to_parent_source(child)
+            key = (parent_source.file_path,
+                   parent_source.first_character_index)
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            parent_sources[key] = parent_source
+
+        ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        return [parent_sources[key] for key, _ in ranked[:k]]
 
     def rerank_parents(self, query: str,
                        sources: list[MinimalSource],
