@@ -3,7 +3,9 @@ import sys
 import streamlit as st
 from streamlit.delta_generator import DeltaGenerator
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 PROCESSED_DIR = "data/processed"
 REPO_ROOT = "data/raw/vllm-0.10.1"
@@ -12,11 +14,24 @@ EVAL_CODE = "data/output/search_results/dataset_code_public.json"
 GT_DOCS = "data/datasets/AnsweredQuestions/dataset_docs_public.json"
 GT_CODE = "data/datasets/AnsweredQuestions/dataset_code_public.json"
 
+NOT_FOUND_MESSAGE = (
+    "I've not found relevant information about this subject "
+    "in my files."
+)
+
+NOT_FOUND_PHRASES = (
+    "not found in the provided sources",
+    "provided sources do not contain",
+    "no relevant information",
+    "i've not found",
+)
+
 st.set_page_config(
     page_title="RAG against the Machine",
     page_icon="🎸",
     layout="wide",
-    initial_sidebar_state="collapsed")
+    initial_sidebar_state="collapsed",
+)
 
 st.markdown("""
 <style>
@@ -43,7 +58,6 @@ st.markdown("""
         background-color: #0a0a0a;
     }
 
-    /* Title */
     .rag-title {
         font-family: 'JetBrains Mono', monospace;
         font-size: 1.6rem;
@@ -62,7 +76,6 @@ st.markdown("""
         margin-bottom: 2rem;
     }
 
-    /* Answer box */
     .answer-box {
         background-color: #111;
         border: 1px solid #1e1e1e;
@@ -76,7 +89,6 @@ st.markdown("""
         margin-bottom: 1.5rem;
     }
 
-    /* Source card */
     .source-card {
         background-color: #0f0f0f;
         border: 1px solid #1a1a1a;
@@ -110,7 +122,6 @@ st.markdown("""
         word-break: break-word;
     }
 
-    /* Metric card */
     .metric-card {
         background-color: #0f0f0f;
         border: 1px solid #1a1a1a;
@@ -192,7 +203,6 @@ st.markdown("""
         margin-bottom: 0.3rem;
     }
 
-    /* Input */
     .stTextInput > div > div > input {
         background-color: #111 !important;
         border: 1px solid #222 !important;
@@ -212,7 +222,6 @@ st.markdown("""
         color: #333 !important;
     }
 
-    /* Button */
     .stButton > button {
         background-color: #ff3b3b !important;
         color: #0a0a0a !important;
@@ -229,22 +238,18 @@ st.markdown("""
         background-color: #cc2f2f !important;
     }
 
-    /* Divider */
     hr {
         border: none;
         border-top: 1px solid #1a1a1a;
         margin: 1.5rem 0;
     }
 
-    /* Hide streamlit branding */
     #MainMenu, footer, header { visibility: hidden; }
 
-    /* Spinner */
     .stSpinner > div {
         border-top-color: #ff3b3b !important;
     }
 
-    /* Selectbox */
     .stSelectbox > div > div {
         background-color: #111 !important;
         border-color: #222 !important;
@@ -278,11 +283,11 @@ def load_generator() -> object:
 
 
 def load_recall_metrics() -> dict:
-    """Load pre-computed Recall@k metrics from evaluation output files.
+    """Load pre-computed Recall@k metrics from evaluation output.
 
     Returns:
-        Dict with 'docs' and 'code' keys, each containing recall scores,
-        or empty dicts if files are not found.
+        Dict with 'docs' and 'code' keys, each containing recall
+        scores, or empty dicts if files are not found.
     """
     from src.evaluator import Evaluator
 
@@ -319,13 +324,13 @@ def render_recall_bars(recall: dict, label: str,
     with col:
         st.markdown(
             f'<div class="metric-label">{label}</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
         if not recall:
             st.markdown(
                 '<div class="status-line">No eval data found.<br>'
                 'Run make eval-docs / eval-code first.</div>',
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
             return
 
@@ -351,10 +356,10 @@ def render_source_card(index: int, file_path: str, first_char: int,
         file_path: Relative path to the source file.
         first_char: Start character index in the file.
         last_char: End character index in the file.
-        text_preview: First 300 characters of the chunk text.
+        text_preview: Preview text for the chunk.
     """
     short_path = file_path.replace("data/raw/vllm-0.10.1/", "")
-    preview = text_preview[:].replace("<", "&lt;").replace(">", "&gt;")
+    preview = text_preview.replace("<", "&lt;").replace(">", "&gt;")
 
     st.markdown(f"""
 <div class="source-card">
@@ -364,20 +369,32 @@ def render_source_card(index: int, file_path: str, first_char: int,
 </div>""", unsafe_allow_html=True)
 
 
+def is_not_found(answer: str) -> bool:
+    """Check whether a generated answer means "not found".
+
+    Args:
+        answer: Generated answer text.
+
+    Returns:
+        True if the answer indicates no answer was found.
+    """
+    answer_lower = answer.lower()
+    return any(p in answer_lower for p in NOT_FOUND_PHRASES)
+
+
 def main() -> None:
     """Main Streamlit application entry point."""
 
-    #  Header
     st.markdown(
         '<div class="rag-title">⚡ RAG against the Machine</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="rag-subtitle">vLLM knowledge base · Qwen3-0.6B</div>',
-        unsafe_allow_html=True
+        '<div class="rag-subtitle">vLLM knowledge base · Qwen3-0.6B'
+        '</div>',
+        unsafe_allow_html=True,
     )
 
-    #  Load models (cached across reruns)
     if "retriever" not in st.session_state:
         with st.spinner("Loading retriever and reranker..."):
             try:
@@ -385,7 +402,8 @@ def main() -> None:
             except Exception as exc:
                 st.error(
                     f"Could not load index: {exc}\n\n"
-                    "Run `make index` before starting the web interface."
+                    "Run `make index` before starting the web "
+                    "interface."
                 )
                 st.stop()
 
@@ -404,18 +422,12 @@ def main() -> None:
     generator = st.session_state.generator
     metrics = st.session_state.recall_metrics
 
-    # Layout: main | sidebar
     col_main, col_right = st.columns([3, 1], gap="large")
 
     with col_right:
-        # System status
         st.markdown(
             '<div class="section-label">System</div>',
-            unsafe_allow_html=True
-        )
-        embed_active = (
-            retriever.embeddings is not None
-            and retriever.embed_model is not None
+            unsafe_allow_html=True,
         )
         reranker_active = retriever.reranker is not None
         n_chunks = len(retriever.chunks)
@@ -430,23 +442,20 @@ def main() -> None:
             style="background:{'#2ecc71' if reranker_active else '#333'}">
         </span>Reranker {'active' if reranker_active else 'off'}
     </div>
-    <div class="status-line">
-        <span class="status-dot"
-            style="background:{'#2ecc71' if embed_active else '#333'}">
-        </span>Embeddings {'active' if embed_active else 'off'}
-    </div>
 </div>""", unsafe_allow_html=True)
 
-        # Recall metrics
         st.markdown(
             '<div class="section-label">Retrieval metrics</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
-        render_recall_bars(metrics.get("docs", {}), "Docs dataset", col_right)
-        render_recall_bars(metrics.get("code", {}), "Code dataset", col_right)
+        render_recall_bars(
+            metrics.get("docs", {}), "Docs dataset", col_right
+        )
+        render_recall_bars(
+            metrics.get("code", {}), "Code dataset", col_right
+        )
 
     with col_main:
-        # Query input
         k_val = st.selectbox(
             "Results (k)",
             options=[3, 5, 10],
@@ -463,7 +472,6 @@ def main() -> None:
         run = st.button("Search & Answer", use_container_width=False)
 
         if run and query and query.strip():
-            # Retrieve
             with st.spinner("Retrieving relevant chunks..."):
                 sources = retriever.search_for_generation(
                     query, k=k_val
@@ -471,13 +479,10 @@ def main() -> None:
 
             if not sources:
                 st.markdown(
-                    '<div class="answer-box">'
-                    "I've not found relevant information about "
-                    "this subject in my files.</div>",
-                    unsafe_allow_html=True
+                    f'<div class="answer-box">{NOT_FOUND_MESSAGE}</div>',
+                    unsafe_allow_html=True,
                 )
             else:
-                # Generate — usar parent_chunks en memoria como en CLI
                 parent_map = retriever.get_parent_chunk_map()
                 context_blocks = []
                 for src in sources:
@@ -486,49 +491,41 @@ def main() -> None:
                     )
                     if parent:
                         context_blocks.append(
-                            f"--- file: {src.file_path} ---\n{parent.text}"
+                            f"--- file: {src.file_path} ---\n"
+                            f"{parent.text}"
                         )
 
                 with st.spinner("Generating answer..."):
-                    answer = generator.answer_with_text(query, context_blocks)
+                    answer = generator.answer_with_text(
+                        query, context_blocks
+                    )
 
                 if not answer or answer.strip() in (
                     "No question provided.",
                     "No relevant sources found.",
-                    "Could not read source content from disk.",
                 ):
-                    answer = (
-                        "I've not found relevant information "
-                        "about this subject in my files."
-                    )
+                    answer = NOT_FOUND_MESSAGE
 
-                # Answer
                 st.markdown(
                     '<div class="section-label">Answer</div>',
-                    unsafe_allow_html=True
+                    unsafe_allow_html=True,
                 )
                 st.markdown(
                     f'<div class="answer-box">{answer}</div>',
-                    unsafe_allow_html=True
+                    unsafe_allow_html=True,
                 )
 
-                # Sources
-                not_found_phrases = [
-                    "not found in the provided sources",
-                    "provided sources do not contain",
-                    "no relevant information",
-                    "i've not found",
-                ]
-                not_found = any(p in answer.lower() for p in not_found_phrases)
-
-                if not not_found:
+                if not is_not_found(answer):
                     st.markdown(
                         '<div class="section-label">Sources</div>',
-                        unsafe_allow_html=True
+                        unsafe_allow_html=True,
                     )
                     for i, source in enumerate(sources, 1):
                         parent = parent_map.get(
-                            (source.file_path, source.first_character_index)
+                            (
+                                source.file_path,
+                                source.first_character_index,
+                            )
                         )
                         text_preview = parent.text if parent else ""
 

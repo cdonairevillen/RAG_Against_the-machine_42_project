@@ -45,11 +45,7 @@ Before running any queries, the vLLM repository must be indexed.
 Place the unzipped repository at `data/raw/vllm-0.10.1/` and run:
 
 ```bash
-# Fast index without embeddings (~15s, used for evaluation)
 make index
-
-# Full index with semantic embeddings (~10 min on CPU, optional bonus)
-make index-embed
 ```
 
 ### Running the system
@@ -98,10 +94,10 @@ The pipeline is composed of five main components:
 vLLM Repository
       │
       ▼
- [Ingester]  — chunks files, builds BM25 + subindices + optional embeddings
+ [Ingester]  — chunks files, builds three BM25 indices
       │
       ▼
- [Retriever] — searches indices, applies query expansion, reranking
+ [Retriever] — routes queries to the right index, reranks when needed
       │
       ▼
  [Generator] — builds prompt, runs Qwen3-0.6B, returns answer
@@ -114,14 +110,14 @@ vLLM Repository
 ```
 
 **Ingester** reads the vLLM repository, applies type-specific chunking
-strategies, and builds three BM25 indices (general, docs-only, code-only)
-plus an optional semantic embedding index.
+strategies, and builds three BM25 indices: a unified index over all
+chunks, a docs-only index, and a code-only index.
 
-**Retriever** exposes two search modes: a fast BM25 path for dataset
-evaluation (`search()`), and a precise path with cross-encoder reranking
-for LLM generation (`search_for_generation()`). Also implements
-`search_with_type_fallback()` and `search_triple_rrf()` as experimental
-alternatives (see Design Decisions).
+**Retriever** exposes a classifier-guided search mode
+(`search_smart()`) that routes each query to whichever per-type index
+it best matches, plus a precise path with cross-encoder reranking for
+LLM generation (`search_for_generation()`). A fast BM25-only path
+(`search()`) is also available for simple lookups.
 
 **Generator** uses Qwen/Qwen3-0.6B via HuggingFace Transformers with
 a strict RAG prompt that prevents hallucination. Generation uses greedy
@@ -138,40 +134,59 @@ and Generator on first use and reuses them across all commands.
 
 ## Chunking Strategy
 
-Two distinct chunking strategies are applied depending on file type,
-with 20% overlap between consecutive chunks to avoid losing context
-at boundaries.
+Chunks are built in two layers — **parents** and **children** — and
+two distinct chunking strategies are applied at the parent level
+depending on file type. Both strategies use 20% overlap when a unit
+must be split further, to avoid losing context at boundaries.
 
-### Python files (`.py`, `.pyi`) — AST-based chunking
+### Python files (`.py`, `.pyi`) — AST-based parent chunking
 
 The file is parsed with Python's `ast` module. Top-level functions and
-classes are extracted as individual chunks, preserving complete syntactic
-units. This guarantees the LLM always receives valid, meaningful code.
+classes are extracted as individual parent chunks, preserving complete
+syntactic units. This guarantees the retriever always works with valid,
+meaningful code rather than an arbitrary line slice.
 
-If a unit exceeds `code_chunk_size` (default: 1200 characters), it is
-further split with overlap. Module-level code (imports, constants) is
-collected as a preamble chunk.
+If a unit exceeds `code_chunk_size` (default: 2000 characters), it is
+further split with overlap. For large classes, each method becomes its
+own chunk prefixed with the class signature, so methods stay
+identifiable even out of context. Module-level code (imports,
+constants) is collected as a preamble chunk.
 
-AST symbol names (class names, method names, attribute names) are stored
-in a separate `Chunk.symbols` field and used for query expansion at
-search time. They are **not** included in the BM25 corpus to avoid
-inflating chunk length and penalising BM25 length normalisation.
+AST symbol names (class names, method names, attribute names) are
+stored in a separate `Chunk.symbols` field and used for query
+expansion at search time. They are **not** included in the BM25 corpus
+to avoid inflating chunk length and penalising BM25 length
+normalisation.
 
-### Markdown and RST files (`.md`, `.rst`, `.txt`) — Header-based chunking
+### Markdown and RST files (`.md`, `.rst`, `.txt`) — header-based parent chunking
 
-Files are split on header lines (`#`). Each section from one header to
-the next becomes one chunk. Sections exceeding `doc_chunk_size`
-(default: 2000 characters) are further split with overlap.
+Files are split on header lines (`#`). Sections smaller than 200
+characters are accumulated together with the next section before being
+flushed as a chunk — a lone `# TPU` header with nothing else under it
+would otherwise become a near-empty parent that downstream ranking
+cannot work with. Tables are kept as indivisible units and prefixed
+with their section title so a table fragment retains its context.
+Sections exceeding `doc_chunk_size` (default: 2000 characters) are
+split with overlap.
 
-### Fallback — Size-based chunking
+### Fallback — size-based chunking
 
 Any readable file not matching the above extensions is split into
 overlapping chunks of `doc_chunk_size` characters.
 
+### Children
+
+Each parent is further split into children (max 600 characters) used
+for BM25 indexing. Children give BM25 precise, low-noise matches;
+once a child matches, its parent — which carries the full surrounding
+context — is what gets returned and passed to the reranker or the LLM.
+Table continuation children get the table header re-attached so a
+mid-table child chunk is still interpretable on its own.
+
 **Chunk size configuration:**
 
 ```bash
-uv run python -m src index --code_chunk_size 1200 --doc_chunk_size 2000
+uv run python -m src index --code_chunk_size 2000 --doc_chunk_size 2000
 ```
 
 ---
@@ -180,107 +195,129 @@ uv run python -m src index --code_chunk_size 1200 --doc_chunk_size 2000
 
 ### BM25 (primary)
 
-The system uses [bm25s](https://github.com/xhluca/bm25s) for all primary
+The system uses [bm25s](https://github.com/xhluca/bm25s) for all
 retrieval. BM25 improves on TF-IDF with two corrections:
 
-1. **TF saturation** — repeated terms have diminishing returns, preventing
-   documents that simply repeat a term from dominating the ranking.
-2. **Length normalisation** — longer documents are penalised so they do
-   not win purely by volume.
+1. **TF saturation** — repeated terms have diminishing returns,
+   preventing documents that simply repeat a term from dominating the
+   ranking.
+2. **Length normalisation** — longer documents are penalised so they
+   do not win purely by volume.
 
-Three separate BM25 indices are maintained:
-- **General index** — all chunks, used for fast evaluation.
+Three separate BM25 indices are maintained over child chunks:
+- **General index** — all chunks, used for the unfiltered fast path
+  and as the candidate pool for code-mode queries.
 - **Docs index** — documentation chunks only.
 - **Code index** — code chunks only.
 
 ### Query Expansion
 
-Before every BM25 search, the query is expanded with identifier variants.
-CamelCase names are decomposed (`PagedAttention` → `Paged Attention
-paged_attention`) and snake_case identifiers are split into parts. Symbol
-names from matching chunks are also appended, allowing BM25 to match
-queries that reference specific class or method names.
+Before every BM25 search, the query is expanded with identifier
+variants. CamelCase names are decomposed (`PagedAttention` → `Paged
+Attention paged_attention`) and snake_case identifiers are split into
+parts. Symbol names from matching chunks are also appended, allowing
+BM25 to match queries that reference specific class or method names.
 
-### Triple-index search (experimental)
+### Classifier-guided routing — `search_smart()`
 
-`search_with_type_fallback` detects query type from the top-3 general
-results and routes to the matching subindex. `search_triple_rrf` fuses
-all three indices with weighted RRF. Both are disabled during evaluation
-due to the corpus imbalance (93% code) — without a reranker to correct
-misclassifications, routing hurts docs recall. Available for interactive
-use where the reranker corrects bias.
+This is the retrieval mode used for both evaluation and the web
+interface. Each query is scored against the doc index and the code
+index independently (mean BM25 score of the top 3 hits in each),
+combined with lexical signals — identifier-like tokens (snake_case,
+CamelCase, code keywords) push the query toward code; natural-language
+markers (`how`, `configure`, `hardware`, `cli`...) push it toward docs.
 
-### Semantic embeddings (optional bonus)
+- **Doc-leaning queries** are answered with plain BM25 over the doc
+  index. No reranker. The cross-encoder consistently ranked code
+  chunks above the correct doc chunk on this corpus, so skipping it
+  here was a measured improvement, not a shortcut.
+- **Code-leaning queries** are answered from the general index
+  filtered down to code chunks, then reranked with the cross-encoder
+  — unless the BM25 signal is already unambiguous (score above 9.0),
+  in which case the reranker is skipped to save time. A handful of
+  doc chunks are always mixed into the candidate pool as a safety net
+  for queries the classifier got slightly wrong.
 
-When enabled with `--use_embeddings True`, the system encodes all chunks
-with `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, L2-normalised)
-and fuses BM25 and cosine similarity rankings with Reciprocal Rank Fusion
-(RRF, k=60). Embeddings improve code recall (+7%) but add ~10 minutes to
-indexing time, so they are disabled by default.
+### Cross-encoder reranking — `cross-encoder/ms-marco-MiniLM-L-6-v2`
 
-### Cross-encoder reranking (for generation only)
-
-When answering questions, the system retrieves k×5 candidates with BM25,
-then reranks them with `cross-encoder/ms-marco-MiniLM-L-6-v2`. The
-cross-encoder scores each (query, chunk) pair jointly, producing a
-relevance score more accurate than BM25 alone. Batch reranking is used
-for efficiency — all pairs are scored in a single forward pass. This
-step is skipped during dataset evaluation to meet the 90-second
-throughput requirement.
+Used in two places: inside `search_smart()` for ambiguous code
+queries, and in `search_for_generation()`, which reranks the combined
+doc+code candidate pool and guarantees at least two doc results
+survive into the final context whenever docs were present in the
+pool. The cross-encoder scores each (query, chunk) pair jointly,
+producing a relevance score more accurate than BM25 alone.
 
 ### Relevance filtering
 
-A minimum BM25 score threshold (4.5) is applied before LLM generation.
-Queries with no relevant content in the corpus (score < 4.5) return
-an empty result without invoking the LLM.
+A minimum BM25 score threshold (5.5) is applied before LLM generation
+in `search_for_generation()`. Queries with no relevant content in the
+corpus return an empty result without invoking the LLM, so the system
+answers "Not found in the provided sources" instead of guessing.
 
 ---
 
 ## Performance Analysis
 
-Results on the private evaluation datasets (Recall@5):
+Results on the private evaluation datasets:
 
 | Dataset | Recall@1 | Recall@3 | Recall@5 | Recall@10 |
 |---------|----------|----------|----------|-----------|
-| Docs    | 0.530    | 0.730    | 0.800    | 0.860     |
-| Code    | 0.250    | 0.480    | 0.530    | 0.590     |
+| Docs    | 0.700    | 0.850    | 0.880    | 0.890     |
+| Code    | 0.440    | 0.630    | 0.670    | 0.750     |
 
-Both datasets exceed the mandatory thresholds (≥0.80 for docs, ≥0.50
-for code).
+Both datasets clear the mandatory thresholds.
 
 **Performance constraints met:**
-- Indexing time: 13s (BM25 only, limit 300s)
-- Warm retrieval throughput: 200 questions in 23s (limit 90s)
+- Indexing time: well under the limit (BM25-only, no embeddings).
+- Code dataset retrieval: 100 questions in ~45s, with the
+  cross-encoder loaded — comfortably inside the throughput window.
 
 ---
 
 ## Design Decisions
 
-**Single unified BM25 index for evaluation.** Three BM25 indices are
-built (general, docs, code) but evaluation uses only the general index.
-Experiments with type-based routing (majority vote on top-3 BM25 results)
-showed that the corpus imbalance (1,701 doc vs 25,085 code chunks, i.e.
-93% code) causes almost all queries to be routed to the code subindex,
-collapsing docs recall from 0.800 to 0.700. The subindices are used in
-`search_with_type_fallback` and `search_triple_rrf` for interactive use,
-where the cross-encoder reranker corrects misclassifications.
+**Per-type BM25 indices instead of one unified index.** Building
+separate doc and code indices, rather than relying on the general
+index alone, was the single biggest improvement to docs recall. The
+vLLM corpus is heavily code-dominated, so any unified ranking
+naturally favours code chunks even for clearly documentation-style
+questions; isolating the doc index removes that competition entirely.
+
+**Lexical + BM25 classifier over a pure score comparison.** Comparing
+raw BM25 scores between the doc and code index alone misclassified
+queries that read as natural language but target a specific function
+or parameter (`"What is the default value of the eps parameter in
+RMSNorm?"`). Adding a count of identifier-like tokens (snake_case,
+CamelCase, code keywords) versus natural-language markers
+substantially reduced these misclassifications without needing a
+trained model.
+
+**Reranker only where it helps, not everywhere.** Initial testing
+applied the cross-encoder uniformly across both datasets. It improved
+code recall but consistently *hurt* docs recall — short, natural
+doc questions were outranked by denser code chunks. The fix was not
+to drop the reranker but to scope it: skip it entirely for doc-mode
+queries, and skip it even for code-mode queries once BM25 is already
+confident (score > 9.0), since reranking a list that BM25 has already
+sorted correctly only adds latency.
 
 **AST chunking over line-based splitting.** Cutting a function in half
-destroys its meaning. AST extraction guarantees the LLM always receives
-complete, syntactically valid units. The performance cost is negligible
-compared to the quality gain.
+destroys its meaning. AST extraction guarantees retrieval always works
+with complete, syntactically valid units. The performance cost is
+negligible compared to the quality gain.
 
-**Symbols stored separately from corpus text.** Adding AST symbol names
-directly to chunk text inflated chunk length and penalised BM25 length
-normalisation, reducing recall. Storing them in a separate field and
-using them only for query expansion avoids this penalty.
+**Symbols stored separately from corpus text.** Adding AST symbol
+names directly to chunk text inflated chunk length and penalised BM25
+length normalisation, reducing recall. Storing them in a separate
+field and using them only for query expansion avoids this penalty.
 
-**Reranker only for generation, not evaluation.** The cross-encoder
-reranker improves retrieval quality (Docs @5: 0.800 → 0.820) but
-processing 50 candidates per query takes ~2 seconds on CPU. For the
-200-question throughput test this would exceed the 90-second limit.
-The reranker is applied only when generating answers, using batch
-prediction to score all pairs in a single forward pass for efficiency.
+**Accumulating small doc sections before flushing a chunk.** Early
+header-based chunking produced parent chunks as small as 5 characters
+for files like `tpu.md`, where a header is followed immediately by
+another header. These near-empty chunks gave the reranker nothing to
+work with and were effectively unretrievable. Accumulating sections
+under 200 characters into the next section before flushing fixed this
+without changing the semantic chunk boundaries that matter.
 
 **Native `model.generate()` instead of manual greedy decoding.** The
 SDK's `get_logits_from_input_ids()` recomputes all previous tokens on
@@ -288,26 +325,29 @@ every step (O(n²) complexity, no KV-cache). Accessing the underlying
 HuggingFace model's `generate()` method directly reduces generation
 time from minutes to seconds per answer.
 
-**Qwen3 chat format with thinking disabled.** Qwen3-0.6B has a built-in
-reasoning mode that emits `<think>` blocks before answering. Using the
-correct chat template with `/no_think` in the user message and stripping
-residual `<think>` blocks with regex prevents the model from outputting
-reasoning traces in the final answer.
+**Qwen3 chat format with thinking disabled.** Qwen3-0.6B has a
+built-in reasoning mode that emits `<think>` blocks before answering.
+Using the correct chat template with `/no_think` in the user message
+and stripping residual `<think>` blocks with regex prevents the model
+from outputting reasoning traces in the final answer.
+
+**Embeddings explored and dropped.** Semantic embeddings
+(`all-MiniLM-L6-v2`, fused with BM25 via Reciprocal Rank Fusion) were
+tested both over the full corpus and restricted to doc chunks only.
+In every configuration tested, they reduced docs recall rather than
+improving it, on top of adding meaningful indexing time. They were
+removed from the pipeline entirely rather than kept as an underused
+option.
 
 ---
 
 ## Challenges Faced
 
 **Windows vs Linux path separators.** During development on Windows,
-`os.path.relpath()` returns backslash-separated paths. The ground-truth
-dataset uses forward slashes. This caused all evaluations to show 0.000
-recall until a `.replace("\\", "/")` normalisation was added to all
-path assignments.
-
-**Double nesting in llm_sdk.** The SDK package structure required
-`from llm_sdk import Small_LLM_Model` rather than the initially assumed
-`from llm_sdk.llm_sdk import Small_LLM_Model`. Misidentifying the import
-path caused import errors that were not immediately obvious.
+`os.path.relpath()` returns backslash-separated paths. The
+ground-truth dataset uses forward slashes. This caused evaluations to
+show near-zero recall until a `.replace("\\", "/")` normalisation was
+added to all path assignments.
 
 **Qwen3 thinking mode.** Qwen3-0.6B defaults to emitting a reasoning
 chain before answering, producing responses like `<think>... </think>
@@ -315,30 +355,29 @@ answer`. This was resolved by adding `/no_think` to the prompt and
 post-processing output with a regex strip.
 
 **Cache space on 42 clusters.** The home directory on 42 machines has
-very limited space (~28 MB free). All HuggingFace model weights, uv
-package cache, and temporary files must be redirected to `/goinfre` via
-environment variables. The Makefile handles this automatically.
+very limited space. All HuggingFace model weights, uv package cache,
+and temporary files must be redirected to `/goinfre` via environment
+variables. The Makefile handles this automatically.
 
-**BM25 score calibration for relevance filtering.** The initial threshold
-of 1.0 was too low — common English words like "you", "are", "stupid"
-scored 2.7-3.3 in the vLLM corpus. Empirical testing across valid and
-invalid queries established 4.5 as a reliable threshold that separates
-relevant queries (score ≥ 5.3) from irrelevant ones (score ≤ 3.3).
+**BM25 score calibration for relevance filtering.** The initial
+threshold was too low — common English phrasing alone could score
+above it in the vLLM corpus. Empirical testing across valid and
+invalid queries established 5.5 as a reliable threshold that filters
+out-of-domain questions without rejecting legitimate ones.
 
-**Embeddings degrading docs recall.** The generic `all-MiniLM-L6-v2`
-model improves code recall (+7%) but slightly reduces docs recall from
-0.800 to 0.820 — a net tradeoff. More critically, encoding 26,786 chunks
-takes ~10 minutes, exceeding the 300-second indexing limit. Embeddings
-are therefore optional and disabled by default.
+**The reranker hurting recall on docs.** The intuitive assumption —
+"a precision reranker can only help" — turned out to be wrong for
+this corpus. Diagnosing this required comparing recall with and
+without the reranker on both datasets separately rather than trusting
+the combined number, which made the effect on docs invisible.
 
-**Triple indexation with imbalanced corpus.** Routing queries to doc or
-code subindices based on BM25 top-k majority vote failed because 93% of
-chunks are code — almost all queries were routed to the code subindex
-regardless of type, collapsing docs recall from 0.800 to 0.700.
-Variants tested: top-1, top-3, top-7, `doc_count >= 1`, RRF with dynamic
-weights. All variants either hurt docs or hurt code. The approach works
-when the cross-encoder reranker corrects misclassifications but violates
-the throughput constraint during evaluation.
+**Near-empty parent chunks from header-only sections.** Files where a
+top-level header is immediately followed by another header (no body
+text in between) produced parent chunks of a handful of characters.
+These chunks technically existed and could be retrieved by BM25, but
+carried no usable context for the reranker or the LLM. Diagnosing this
+required tracing individual ground-truth misses back to their parent
+chunk text, not just their BM25 rank.
 
 ---
 
@@ -392,7 +431,6 @@ and larger numbers of heads, V2 when context length exceeds 8192 tokens.
 ### Models
 
 - [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) — generation model
-- [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) — embedding model
 
 ### Tools
 

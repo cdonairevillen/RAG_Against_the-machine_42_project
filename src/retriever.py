@@ -7,26 +7,59 @@ from src.models import MinimalSource
 
 RRF_K = 60
 
+CODE_SIGNAL_TERMS = {
+    "def", "return", "attribute", "instance",
+    "import", "module", "init", "self",
+}
+
+DOC_SIGNAL_TERMS = {
+    "how", "what", "when", "where", "why", "configure",
+    "install", "setup", "guide", "documentation", "example",
+    "tutorial", "start", "run", "serve", "deploy", "support",
+    "compatible", "hardware", "version", "requirement",
+    "platform", "gpu", "rocm", "amd", "cli", "command",
+    "api", "endpoint", "port", "package",
+    "capability", "compute", "status", "feature",
+}
+
+CLASSIFIER_MARGIN = 0.5
+CODE_SIGNAL_WEIGHT = 0.5
+DOC_SIGNAL_WEIGHT = 0.5
+SKIP_RERANK_SCORE = 9.0
+BM25_SCORE_FLOOR = 5.5
+
 
 def expand_query(query: str, chunks: Optional[list] = None) -> str:
-    """Expand a query with identifier variants to improve BM25 recall."""
+    """Expand a query with identifier variants to improve BM25 recall.
+
+    Detects CamelCase class names and snake_case identifiers in the
+    query and adds decomposed variants. When chunks are provided,
+    also boosts terms found in Chunk.symbols that match query tokens.
+
+    Args:
+        query: The original natural-language search string.
+        chunks: Optional list of Chunk objects. When provided, symbol
+            names matching query tokens are appended to the query.
+
+    Returns:
+        Expanded query string with additional identifier variants.
+    """
     extras: list[str] = []
 
     camel_pattern = re.compile(
-        r'\b([A-Z][a-zA-Z0-9]*(?:[A-Z][a-z0-9]+)+)\b'
+        r"\b([A-Z][a-zA-Z0-9]*(?:[A-Z][a-z0-9]+)+)\b"
     )
     for match in camel_pattern.finditer(query):
         term = match.group(1)
-        parts = re.sub(r'([A-Z])', r' \1', term).strip().split()
+        parts = re.sub(r"([A-Z])", r" \1", term).strip().split()
         if len(parts) > 1:
             extras.extend(parts)
             extras.append("_".join(p.lower() for p in parts))
 
-    snake_pattern = re.compile(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+){2,})\b')
+    snake_pattern = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+){2,})\b")
     for match in snake_pattern.finditer(query):
         term = match.group(1)
-        parts = term.split("_")
-        extras.extend(parts)
+        extras.extend(term.split("_"))
 
     if chunks:
         query_tokens = set(query.lower().split())
@@ -47,38 +80,44 @@ def expand_query(query: str, chunks: Optional[list] = None) -> str:
 
 
 class Retriever:
-    """Searches the indexed knowledge base using BM25 with query expansion.
+    """Searches the indexed knowledge base using dual BM25 indices.
 
-    Provides three search modes:
-        search()              — fast BM25-only, maps children to parents.
-        search_smart()        — BM25 for docs, reranker for code.
-        search_dual()         — separate BM25 indices for docs and code,
-                                interleaved. No reranker needed.
-        search_for_generation() — BM25 + reranker, used before the LLM.
+    Provides several search modes:
+        search()                — fast BM25-only, maps children to
+                                   parents.
+        search_no_rerank()      — same as search(), explicit name.
+        search_smart()          — classifier-guided: BM25 doc index
+                                   for doc queries, reranker-filtered
+                                   code index for code queries. The
+                                   default and best-performing mode.
+        search_for_generation() — BM25 + reranker over the unified
+                                   index, used before the LLM.
 
     Attributes:
-        chunks: All indexed Chunk objects (children).
+        chunks: All indexed child Chunk objects.
         parent_chunks: All parent Chunk objects.
-        bm25: Fitted unified BM25 instance.
-        bm25_code: Fitted BM25 instance for code chunks only.
-        bm25_doc: Fitted BM25 instance for doc chunks only.
+        bm25: Fitted unified BM25 instance over all child chunks.
+        bm25_code: Fitted BM25 instance over code child chunks only.
+        bm25_doc: Fitted BM25 instance over doc child chunks only.
         code_chunk_indices: Indices into chunks[] for code chunks.
         doc_chunk_indices: Indices into chunks[] for doc chunks.
-        embeddings: Dense vectors for all chunks, or None.
-        embed_model: Loaded SentenceTransformer, or None.
-        reranker: Loaded CrossEncoder, or None.
+        reranker: Loaded CrossEncoder, or None until load_reranker().
     """
 
-    EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
     RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     def __init__(self, chunks: list[Chunk],
-                 bm25: bm25s.BM25,
-                 embeddings: Optional[np.ndarray] = None) -> None:
+                 bm25: bm25s.BM25) -> None:
+        """Initialise with pre-loaded components.
+
+        Prefer Retriever.from_disk() for normal usage.
+
+        Args:
+            chunks: All child Chunk objects in corpus order.
+            bm25: Fitted unified BM25 instance.
+        """
         self.chunks = chunks
         self.bm25 = bm25
-        self.embeddings = embeddings
-        self.embed_model = None
         self.reranker = None
 
         self.chunk_map: dict = {}
@@ -89,12 +128,6 @@ class Retriever:
         self.bm25_doc: Optional[bm25s.BM25] = None
         self.code_chunk_indices: list[int] = []
         self.doc_chunk_indices: list[int] = []
-
-        if embeddings is not None:
-            self.load_embed_model()
-
-        self.doc_embeddings: Optional[np.ndarray] = None
-        self.doc_parent_indices: list[int] = []
 
     def get_chunk_map(self) -> dict:
         """Return cached child chunk map keyed by (file_path, first_char)."""
@@ -114,18 +147,13 @@ class Retriever:
             }
         return self.parent_chunk_map
 
-    def load_embed_model(self) -> None:
-        """Load the sentence-transformers model for query encoding."""
-        try:
-            from sentence_transformers import SentenceTransformer
-            self.embed_model = SentenceTransformer(self.EMBED_MODEL)
-            print("Embedding model loaded — hybrid retrieval active.")
-        except Exception as exc:
-            print(f"Warning: embedding model unavailable ({exc}).")
-            self.embeddings = None
-
     def load_reranker(self) -> None:
-        """Load the cross-encoder reranker model."""
+        """Load the cross-encoder reranker model.
+
+        Call this explicitly before search_smart() or
+        search_for_generation() when precision matters. Falls back
+        gracefully if the model cannot be loaded.
+        """
         try:
             from sentence_transformers import CrossEncoder
             self.reranker = CrossEncoder(self.RERANKER_MODEL)
@@ -136,26 +164,27 @@ class Retriever:
 
     @classmethod
     def from_disk(cls, processed_dir: str) -> "Retriever":
-        """Load a Retriever from a directory produced by Ingester.save()."""
+        """Load a Retriever from a directory produced by Ingester.save().
+
+        Args:
+            processed_dir: Path containing chunks/ and the BM25
+                index directories.
+
+        Returns:
+            A ready-to-use Retriever instance.
+
+        Raises:
+            RuntimeError: If the unified BM25 index fails to load.
+        """
         ingester = Ingester.load(processed_dir)
         if ingester.bm25 is None:
             raise RuntimeError("BM25 index failed to load from disk.")
-        retriever = cls(
-            chunks=ingester.chunks,
-            bm25=ingester.bm25,
-            embeddings=ingester.doc_embeddings,
-        )
+        retriever = cls(chunks=ingester.chunks, bm25=ingester.bm25)
         retriever.parent_chunks = ingester.parent_chunks
         retriever.bm25_code = ingester.bm25_code
         retriever.bm25_doc = ingester.bm25_doc
         retriever.code_chunk_indices = ingester.code_chunk_indices
         retriever.doc_chunk_indices = ingester.doc_chunk_indices
-        retriever.doc_embeddings = ingester.doc_embeddings
-        retriever.doc_parent_indices = ingester.doc_parent_indices
-
-        if ((retriever.doc_embeddings is not None) and (retriever.embed_model
-                                                        is None)):
-            retriever.load_embed_model()
         return retriever
 
     def search(self, query: str, k: int = 10) -> list[MinimalSource]:
@@ -168,17 +197,11 @@ class Retriever:
         Returns:
             Ranked list of parent MinimalSource objects.
         """
-        if not query or not query.strip() or k <= 0:
-            return []
+        return self.search_no_rerank(query, k)
 
-        expanded = expand_query(query, self.chunks)
-
-        if self.embeddings is not None and self.embed_model is not None:
-            return self.search_hybrid(expanded, k)
-        return self.search_bm25(expanded, k, min_score=0.0)
-
-    def search_no_rerank(self, query: str, k: int = 10) -> list[MinimalSource]:
-        """BM25 retrieval mapping children to parents, no reranker.
+    def search_no_rerank(self, query: str,
+                         k: int = 10) -> list[MinimalSource]:
+        """BM25 retrieval over the unified index, mapped to parents.
 
         Args:
             query: Natural-language search string.
@@ -192,7 +215,9 @@ class Retriever:
 
         expanded = expand_query(query, self.chunks)
         fetch_k = min(k * 5, len(self.chunks))
-        child_candidates = self.search_bm25(expanded, fetch_k, min_score=0.0)
+        child_candidates = self.search_bm25(
+            expanded, fetch_k, min_score=0.0
+        )
 
         parent_map = self.get_chunk_map()
         seen: set = set()
@@ -205,8 +230,10 @@ class Retriever:
             if child is None:
                 continue
             parent_source = self.child_to_parent_source(child)
-            key = (parent_source.file_path,
-                   parent_source.first_character_index)
+            key = (
+                parent_source.file_path,
+                parent_source.first_character_index,
+            )
             if key not in seen:
                 seen.add(key)
                 parent_sources.append(parent_source)
@@ -215,176 +242,185 @@ class Retriever:
 
         return parent_sources
 
-    def rerank_by_embeddings(self, query: str,
-                             sources: list[MinimalSource],
-                             k: int) -> list[MinimalSource]:
-        """Reorder doc sources by semantic similarity."""
-        if ((not sources or self.doc_embeddings is None) or (self.embed_model
-                                                             is None)):
-            return sources[:k]
+    def classify_query(self, query: str) -> tuple[float, float]:
+        """Score a query's affinity for the doc vs. code index.
 
-        embed_idx = {
-            (self.parent_chunks[i].file_path,
-             self.parent_chunks[i].first_character_index): rank
-            for rank, i in enumerate(self.doc_parent_indices)
-            if i < len(self.parent_chunks)
-        }
+        Combines the mean top-3 BM25 score from each per-type index
+        with lexical signal counts (identifier-like tokens favour
+        code, natural-language tokens favour docs).
 
-        query_vec = self.embed_model.encode(
-            [query], normalize_embeddings=True, convert_to_numpy=True,
+        Args:
+            query: The expanded search string.
+
+        Returns:
+            Tuple of (combined_code_score, combined_doc_score).
+        """
+        doc_top_score = 0.0
+        code_top_score = 0.0
+        try:
+            tokenized = bm25s.tokenize(
+                [query], stopwords="en", show_progress=False
+            )
+            if self.bm25_doc is not None:
+                _, ds = self.bm25_doc.retrieve(
+                    tokenized, k=3, show_progress=False
+                )
+                doc_top_score = float(np.mean(ds[0]))
+            if self.bm25_code is not None:
+                _, cs = self.bm25_code.retrieve(
+                    tokenized, k=3, show_progress=False
+                )
+                code_top_score = float(np.mean(cs[0]))
+        except Exception:
+            pass
+
+        query_terms = set(query.lower().split())
+        code_signals = sum(
+            1 for t in query_terms
+            if "_" in t
+            or (t[0].isupper() if t else False)
+            or t in CODE_SIGNAL_TERMS
+        )
+        doc_signals = sum(
+            1 for t in query_terms if t in DOC_SIGNAL_TERMS
         )
 
-        scored: list[tuple[float, MinimalSource]] = []
-        for src in sources:
-            key = (src.file_path, src.first_character_index)
-            pidx = embed_idx.get(key)
-            if pidx is None or pidx >= len(self.doc_embeddings):
-                scored.append((0.0, src))
-                continue
-            score = float((self.doc_embeddings[pidx] @ query_vec.T).squeeze())
-            scored.append((score, src))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [src for _, src in scored[:k]]
+        combined_code = code_top_score + code_signals * CODE_SIGNAL_WEIGHT
+        combined_doc = doc_top_score + doc_signals * DOC_SIGNAL_WEIGHT
+        return combined_code, combined_doc
 
     def search_smart(self, query: str, k: int = 10) -> list[MinimalSource]:
-        """
-        Classifier-guided retrieval — doc index for docs,
-        reranker for code.
+        """Classifier-guided retrieval: doc index for docs, reranker
+        for code.
+
+        Routes each query to whichever per-type index it best
+        matches. Doc queries are served by BM25 alone over the doc
+        index (the reranker hurts doc ranking on this corpus). Code
+        queries are served by the unified index filtered to code
+        chunks, reranked unless the BM25 signal is already
+        unambiguous — in which case the reranker is skipped to save
+        time. A handful of doc results are always mixed into the
+        code-mode pool as a safety net for borderline queries.
+
+        Args:
+            query: Natural-language search string.
+            k: Number of results to return.
+
+        Returns:
+            Ranked list of parent MinimalSource objects.
         """
         if not query or not query.strip() or k <= 0:
             return []
 
         expanded = expand_query(query, self.chunks)
+        combined_code, combined_doc = self.classify_query(expanded)
 
-        # Clasificador: comparar scores top-3 de cada índice + señales léxicas
-        doc_top_score = 0.0
-        code_top_score = 0.0
-        try:
-            tokenized = bm25s.tokenize([expanded], stopwords="en",
-                                       show_progress=False)
-            _, ds = self.bm25_doc.retrieve(tokenized, k=3,
-                                           show_progress=False)
-            doc_top_score = float(np.mean(ds[0]))
-            _, cs = self.bm25_code.retrieve(tokenized, k=3,
-                                            show_progress=False)
-            code_top_score = float(np.mean(cs[0]))
-        except Exception:
-            pass
+        if combined_code > combined_doc + CLASSIFIER_MARGIN:
+            return self._search_smart_code(expanded, k, combined_code)
+        return self._search_smart_docs(expanded, k)
 
-        query_terms = set(expanded.lower().split())
-        code_term_signals = sum(1 for t in query_terms if (
-            '_' in t or
-            (t[0].isupper() if t else False) or
-            t in {'class', 'def', 'return', 'attribute',
-                  'instance', 'import', 'module', 'init',
-                  'self'}
-        ))
-        doc_term_signals = sum(1 for t in query_terms if t in {
-            'how', 'what', 'when', 'where', 'why', 'configure',
-            'install', 'setup', 'guide', 'documentation', 'example',
-            'tutorial', 'start', 'run', 'serve', 'deploy', 'support',
-            'compatible', 'hardware', 'version', 'requirement',
-            'platform', 'gpu', 'rocm', 'amd', 'cli', 'command',
-            'api', 'endpoint', 'port', 'package', 'install',
-            'capability', 'compute', 'status', 'feature'
-        })
+    def _search_smart_code(self, expanded: str, k: int,
+                           code_top_score: float) -> list[MinimalSource]:
+        """Code-mode branch of search_smart(). See that method."""
+        fetch_k = min(k * 10, len(self.chunks))
+        candidates = self.search_bm25(expanded, fetch_k, min_score=0.0)
+        chunk_map = self.get_chunk_map()
 
-        combined_code = code_top_score + code_term_signals * 0.5
-        combined_doc = doc_top_score + doc_term_signals * 0.5
-        MARGIN = 0.5
+        code_sources: list[MinimalSource] = []
+        seen: set = set()
+        for source in candidates:
+            child = chunk_map.get(
+                (source.file_path, source.first_character_index)
+            )
+            if child is None or child.chunk_type != "code":
+                continue
+            parent_source = self.child_to_parent_source(child)
+            key = (
+                parent_source.file_path,
+                parent_source.first_character_index,
+            )
+            if key not in seen:
+                seen.add(key)
+                code_sources.append(parent_source)
+            if len(code_sources) >= k * 3:
+                break
 
-        if combined_code > combined_doc + MARGIN:
-            # Modo código: BM25 unificado filtrado + reranker
-            fetch_k = min(k * 10, len(self.chunks))
-            candidates = self.search_bm25(expanded, fetch_k, min_score=0.0)
-            chunk_map = self.get_chunk_map()
-            code_sources: list[MinimalSource] = []
-            seen: set = set()
-            for source in candidates:
-                child = chunk_map.get(
-                    (source.file_path, source.first_character_index)
+        doc_backup: list[MinimalSource] = []
+        if self.bm25_doc is not None and self.doc_chunk_indices:
+            try:
+                tokenized = bm25s.tokenize(
+                    [expanded], stopwords="en", show_progress=False
                 )
-                if child is None or child.chunk_type != "code":
-                    continue
-                parent_source = self.child_to_parent_source(child)
-                key = (parent_source.file_path,
-                       parent_source.first_character_index)
-                if key not in seen:
-                    seen.add(key)
-                    code_sources.append(parent_source)
-                if len(code_sources) >= k * 3:
-                    break
-
-            # Añadir 2 docs del índice de docs como seguridad
-            doc_backup: list[MinimalSource] = []
-            if self.bm25_doc is not None and self.doc_chunk_indices:
-                try:
-                    tokenized = bm25s.tokenize([expanded], stopwords="en",
-                                               show_progress=False)
-                    results, _ = self.bm25_doc.retrieve(tokenized, k=10,
-                                                        show_progress=False)
-                    seen_d: set = set()
-                    for idx in results[0].tolist():
-                        chunk = self.chunks[self.doc_chunk_indices[int(idx)]]
-                        ps = self.child_to_parent_source(chunk)
-                        key = (ps.file_path, ps.first_character_index)
-                        if key not in seen_d and key not in seen:
-                            seen_d.add(key)
-                            doc_backup.append(ps)
-                        if len(doc_backup) >= 4:
-                            break
-                except Exception:
-                    pass
-
-            # Reranker solo si hay ambigüedad — si code_top_score > 12,
-            # BM25 directo
-            if code_top_score > 9.0:
-                return code_sources[:k]
-            return self.rerank_parents(query, code_sources + doc_backup, k)
-
-        else:
-            # Modo docs: índice de docs primero
-            fetch_k = min(k * 5, len(self.doc_chunk_indices))
-            doc_sources: list[MinimalSource] = []
-            if self.bm25_doc is not None and self.doc_chunk_indices:
-                try:
-                    tokenized = bm25s.tokenize([expanded], stopwords="en",
-                                               show_progress=False)
-                    results, _ = self.bm25_doc.retrieve(tokenized, k=fetch_k,
-                                                        show_progress=False)
-                    seen_d: set = set()
-                    for idx in results[0].tolist():
-                        chunk = self.chunks[self.doc_chunk_indices[int(idx)]]
-                        ps = self.child_to_parent_source(chunk)
-                        key = (ps.file_path, ps.first_character_index)
-                        if key not in seen_d:
-                            seen_d.add(key)
-                            doc_sources.append(ps)
-                except Exception:
-                    pass
-
-            # Si hay pocos docs, completar con el índice unificado
-            if len(doc_sources) < k:
-                unified = self.search_no_rerank(query, k * 2)
-                seen_u = {(s.file_path, s.first_character_index)
-                          for s in doc_sources}
-                for src in unified:
-                    if len(doc_sources) >= k * 2:
+                results, _ = self.bm25_doc.retrieve(
+                    tokenized, k=10, show_progress=False
+                )
+                seen_doc: set = set()
+                for idx in results[0].tolist():
+                    chunk = self.chunks[self.doc_chunk_indices[int(idx)]]
+                    ps = self.child_to_parent_source(chunk)
+                    key = (ps.file_path, ps.first_character_index)
+                    if key not in seen_doc and key not in seen:
+                        seen_doc.add(key)
+                        doc_backup.append(ps)
+                    if len(doc_backup) >= 4:
                         break
-                    key = (src.file_path, src.first_character_index)
-                    if key not in seen_u:
-                        seen_u.add(key)
-                        doc_sources.append(src)
+            except Exception:
+                pass
 
-            # Reordenar por embeddings si disponibles
-            if ((self.doc_embeddings is not None) and (self.embed_model
-                                                       is not None)):
-                return self.rerank_by_embeddings(query, doc_sources, k)
-            return doc_sources[:k]
+        if code_top_score > SKIP_RERANK_SCORE:
+            return code_sources[:k]
+        return self.rerank_parents(expanded, code_sources + doc_backup, k)
+
+    def _search_smart_docs(self, expanded: str,
+                           k: int) -> list[MinimalSource]:
+        """Doc-mode branch of search_smart(). See that method."""
+        fetch_k = min(k * 5, len(self.doc_chunk_indices))
+        doc_sources: list[MinimalSource] = []
+
+        if self.bm25_doc is not None and self.doc_chunk_indices:
+            try:
+                tokenized = bm25s.tokenize(
+                    [expanded], stopwords="en", show_progress=False
+                )
+                results, _ = self.bm25_doc.retrieve(
+                    tokenized, k=fetch_k, show_progress=False
+                )
+                seen: set = set()
+                for idx in results[0].tolist():
+                    chunk = self.chunks[self.doc_chunk_indices[int(idx)]]
+                    ps = self.child_to_parent_source(chunk)
+                    key = (ps.file_path, ps.first_character_index)
+                    if key not in seen:
+                        seen.add(key)
+                        doc_sources.append(ps)
+            except Exception:
+                pass
+
+        if len(doc_sources) < k:
+            unified = self.search_no_rerank(expanded, k * 2)
+            seen_unified = {
+                (s.file_path, s.first_character_index)
+                for s in doc_sources
+            }
+            for src in unified:
+                if len(doc_sources) >= k * 2:
+                    break
+                key = (src.file_path, src.first_character_index)
+                if key not in seen_unified:
+                    seen_unified.add(key)
+                    doc_sources.append(src)
+
+        return doc_sources[:k]
 
     def get_top_bm25_score(self, query: str) -> float:
-        """Return the highest BM25 score for a query over the corpus."""
+        """Return the highest BM25 score for a query over the corpus.
+
+        Args:
+            query: Search string.
+
+        Returns:
+            Highest score, or 0.0 on error.
+        """
         try:
             tokenized = bm25s.tokenize(
                 [query], stopwords="en", show_progress=False
@@ -399,12 +435,20 @@ class Retriever:
     def rerank_parents(self, query: str,
                        sources: list[MinimalSource],
                        k: int) -> list[MinimalSource]:
-        """Rerank parent sources using parent chunk text."""
+        """Rerank parent sources using parent chunk text.
+
+        Args:
+            query: The original search string.
+            sources: Parent MinimalSource objects to rerank.
+            k: Number of top results to return.
+
+        Returns:
+            Reranked and truncated MinimalSource list.
+        """
         if self.reranker is None or not sources:
             return sources[:k]
 
         parent_map = self.get_parent_chunk_map()
-
         pairs: list[tuple[str, str]] = []
         for source in sources:
             parent = parent_map.get(
@@ -427,6 +471,11 @@ class Retriever:
                               k: int = 10) -> list[MinimalSource]:
         """Precise retrieval for LLM generation — BM25 + reranker.
 
+        Searches the unified index, splits candidates into doc and
+        code parents, reranks them together, and guarantees at least
+        two doc results survive into the final list when docs were
+        present in the candidate pool.
+
         Args:
             query: Natural-language search string.
             k: Number of results to return after reranking.
@@ -437,7 +486,7 @@ class Retriever:
         if not query or not query.strip() or k <= 0:
             return []
 
-        if self.get_top_bm25_score(query) < 5.5:
+        if self.get_top_bm25_score(query) < BM25_SCORE_FLOOR:
             return []
 
         if self.reranker is None:
@@ -445,12 +494,9 @@ class Retriever:
 
         expanded = expand_query(query, self.chunks)
         fetch_k = min(k * 5, len(self.chunks))
-
-        if self.embeddings is not None and self.embed_model is not None:
-            child_candidates = self.search_hybrid(expanded, fetch_k)
-        else:
-            child_candidates = self.search_bm25(expanded, fetch_k,
-                                                min_score=0.0)
+        child_candidates = self.search_bm25(
+            expanded, fetch_k, min_score=0.0
+        )
 
         parent_map = self.get_chunk_map()
         seen: set = set()
@@ -464,8 +510,10 @@ class Retriever:
             if child is None:
                 continue
             parent_source = self.child_to_parent_source(child)
-            key = (parent_source.file_path,
-                   parent_source.first_character_index)
+            key = (
+                parent_source.file_path,
+                parent_source.first_character_index,
+            )
             if key not in seen:
                 seen.add(key)
                 if child.chunk_type == "doc":
@@ -474,25 +522,24 @@ class Retriever:
                     code_sources.append(parent_source)
 
         all_sources = doc_sources + code_sources
-        reranked = self.rerank_parents(query, all_sources,
-                                       k + min(2, len(doc_sources)))
+        reranked = self.rerank_parents(
+            query, all_sources, k + min(2, len(doc_sources))
+        )
 
         result: list[MinimalSource] = []
         seen_result: set = set()
         min_docs = min(2, len(doc_sources))
+        doc_keys = {
+            (d.file_path, d.first_character_index) for d in doc_sources
+        }
 
         for src in reranked:
             key = (src.file_path, src.first_character_index)
-            if key not in seen_result:
-                parent = self.get_parent_chunk_map().get(key)
-                if parent and any(
-                    (d.file_path, d.first_character_index) == key
-                    for d in doc_sources
-                ):
-                    result.append(src)
-                    seen_result.add(key)
-                    if len(result) >= min_docs:
-                        break
+            if key not in seen_result and key in doc_keys:
+                result.append(src)
+                seen_result.add(key)
+                if len(result) >= min_docs:
+                    break
 
         for src in reranked:
             key = (src.file_path, src.first_character_index)
@@ -506,7 +553,16 @@ class Retriever:
 
     def search_bm25(self, query: str, k: int,
                     min_score: float = 0.0) -> list[MinimalSource]:
-        """BM25-only retrieval over the unified index."""
+        """BM25-only retrieval over the unified index.
+
+        Args:
+            query: Search string (already expanded).
+            k: Number of results.
+            min_score: Minimum BM25 score to include a result.
+
+        Returns:
+            Ranked MinimalSource list.
+        """
         try:
             tokenized = bm25s.tokenize(
                 [query], stopwords="en", show_progress=False
@@ -520,66 +576,21 @@ class Retriever:
         except Exception:
             return []
 
-        return [self.chunk_to_source(self.chunks[int(idx)])
-                for idx, score in zip(indices, result_scores)
-                if score >= min_score]
-
-    def search_hybrid(self, query: str, k: int) -> list[MinimalSource]:
-        """Hybrid retrieval: BM25 + semantic embeddings fused with RRF."""
-        fetch_k = min(k * 2, len(self.chunks))
-        rrf_scores: dict[int, float] = {}
-
-        bm25_indices = self.retrieve_from_bm25(query, fetch_k)
-        for rank, idx in enumerate(bm25_indices):
-            rrf_scores[idx] = (
-                rrf_scores.get(idx, 0.0) + 1.0 / (RRF_K + rank)
-            )
-
-        embed_indices = self.retrieve_from_embeddings(query, fetch_k)
-        for rank, idx in enumerate(embed_indices):
-            rrf_scores[idx] = (
-                rrf_scores.get(idx, 0.0) + 1.0 / (RRF_K + rank)
-            )
-
-        ranked = sorted(
-            rrf_scores.items(), key=lambda x: x[1], reverse=True
-        )
         return [
-            self.chunk_to_source(self.chunks[idx])
-            for idx, _ in ranked[:k]
+            self.chunk_to_source(self.chunks[int(idx)])
+            for idx, score in zip(indices, result_scores)
+            if score >= min_score
         ]
 
-    def retrieve_from_bm25(self, query: str, k: int) -> list[int]:
-        """Run a BM25 query and return chunk indices."""
-        try:
-            tokenized = bm25s.tokenize(
-                [query], stopwords="en", show_progress=False
-            )
-            results, _ = self.bm25.retrieve(
-                tokenized, k=k, show_progress=False
-            )
-            return results[0].tolist()
-        except Exception:
-            return []
-
-    def retrieve_from_embeddings(self, query: str, k: int) -> list[int]:
-        """Return top-k chunk indices by cosine similarity."""
-        if self.embed_model is None or self.embeddings is None:
-            return []
-
-        query_vec: np.ndarray = self.embed_model.encode(
-            [query],
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        )
-        scores = (self.embeddings @ query_vec.T).squeeze()
-        effective_k = min(k, len(self.chunks))
-        top_indices = np.argpartition(scores, -effective_k)[-effective_k:]
-        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
-        return top_indices.tolist()
-
     def chunk_to_source(self, chunk: Chunk) -> MinimalSource:
-        """Convert a Chunk to a MinimalSource."""
+        """Convert a Chunk to the MinimalSource model the CLI expects.
+
+        Args:
+            chunk: Internal Chunk dataclass.
+
+        Returns:
+            MinimalSource Pydantic model.
+        """
         return MinimalSource(
             file_path=chunk.file_path,
             first_character_index=chunk.first_character_index,
@@ -587,11 +598,20 @@ class Retriever:
         )
 
     def child_to_parent_source(self, child: Chunk) -> MinimalSource:
-        """Map a child chunk to its parent's MinimalSource."""
-        if child.parent_id >= 0 and child.parent_id < len(self.parent_chunks):
+        """Map a child chunk to its parent's MinimalSource.
+
+        Args:
+            child: Child Chunk with parent_id set.
+
+        Returns:
+            MinimalSource of the parent chunk, or the child's own
+            source if it has no parent.
+        """
+        if 0 <= child.parent_id < len(self.parent_chunks):
             parent = self.parent_chunks[child.parent_id]
             return MinimalSource(
                 file_path=parent.file_path,
                 first_character_index=parent.first_character_index,
-                last_character_index=parent.last_character_index)
+                last_character_index=parent.last_character_index,
+            )
         return self.chunk_to_source(child)

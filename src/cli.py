@@ -1,28 +1,32 @@
+import os
+from pydantic import BaseModel
+from tqdm import tqdm
+
 from src.retriever import Retriever
 from src.generator import Generator
 from src.ingester import Chunk
-from pydantic import BaseModel
-import os
-from tqdm import tqdm
-from src.models import (MinimalAnswer,
-                        MinimalSearchResults,
-                        RagDataset,
-                        StudentSearchResults,
-                        StudentSearchResultsAndAnswer,
-                        MinimalSource)
+from src.models import (
+    MinimalAnswer,
+    MinimalSearchResults,
+    RagDataset,
+    StudentSearchResults,
+    StudentSearchResultsAndAnswer,
+    MinimalSource,
+)
 
 PROCESSED_DIR = "data/processed"
 REPO_ROOT = "data/raw/vllm-0.10.1"
 
 
 class CLI:
-    """RAG against the Machine — single orchestrator and CLI entry point.
+    """RAG against the Machine — single orchestrator and CLI entry
+    point.
 
-    Loads Retriever and Generator lazily on first use and reuses them
-    for all subsequent calls within the same process.
+    Loads Retriever and Generator lazily on first use and reuses
+    them for all subsequent calls within the same process.
 
     Commands:
-        index           Build BM25 and optional embedding indices.
+        index           Build the BM25 indices.
         search          Search for a single query (fast, no reranker).
         search_dataset  Batch retrieval over a full dataset JSON.
         answer          Answer a single question (with reranker).
@@ -31,25 +35,50 @@ class CLI:
 
     Examples:
         uv run python -m src index
-        uv run python -m src search "How to configure OpenAI server?" --k 10
-        uv run python -m src answer "How to configure OpenAI server?" --k 10
+        uv run python -m src search "How to configure OpenAI server?"
+        uv run python -m src answer "How to configure OpenAI server?"
         uv run python -m src search_dataset \\
-    --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json
+            --dataset_path \\
+            data/datasets/UnansweredQuestions/dataset_docs_public.json
         uv run python -m src answer_dataset \\
-    --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json
+            --dataset_path \\
+            data/datasets/UnansweredQuestions/dataset_docs_public.json
         uv run python -m src evaluate \\
-    --student_answer_path data/output/search_results/dataset_docs_public.json
-    --dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json
+            --student_answer_path \\
+            data/output/search_results/dataset_docs_public.json \\
+            --dataset_path \\
+            data/datasets/AnsweredQuestions/dataset_docs_public.json
     """
 
     def __init__(self, processed_dir: str = PROCESSED_DIR,
                  repo_root: str = REPO_ROOT) -> None:
+        """Initialise the CLI orchestrator.
+
+        Args:
+            processed_dir: Directory containing chunks and BM25
+                indices.
+            repo_root: Root of the vLLM repository (used by
+                Generator).
+        """
         self.processed_dir = processed_dir
         self.repo_root = repo_root
         self.retriever: Retriever | None = None
         self.generator: Generator | None = None
 
     def get_retriever(self, with_reranker: bool = True) -> Retriever:
+        """Load and cache the Retriever.
+
+        Args:
+            with_reranker: When True, also loads the cross-encoder
+                reranker.
+
+        Returns:
+            The loaded Retriever instance.
+
+        Raises:
+            Exception: Propagates any load error after printing a
+                message.
+        """
         if self.retriever is None:
             try:
                 self.retriever = Retriever.from_disk(self.processed_dir)
@@ -64,6 +93,14 @@ class CLI:
         return self.retriever
 
     def get_generator(self) -> Generator:
+        """Load and cache the Generator.
+
+        Returns:
+            The loaded Generator instance.
+
+        Raises:
+            Exception: Propagates any model load error.
+        """
         if self.generator is None:
             try:
                 self.generator = Generator(repo_root=self.repo_root)
@@ -74,9 +111,21 @@ class CLI:
 
     def index(self, repo_root: str = REPO_ROOT,
               max_chunk_size: int = 2000,
-              code_chunk_size: int = 2000, doc_chunk_size: int = 2000,
+              code_chunk_size: int = 2000,
+              doc_chunk_size: int = 2000,
               output_dir: str = PROCESSED_DIR,
               use_embeddings: bool = False) -> None:
+        """Ingest the vLLM repository and persist the BM25 indices.
+
+        Args:
+            repo_root: Path to the vLLM repository root.
+            max_chunk_size: Overrides both code and doc chunk size
+                when different from the 2000-char default.
+            code_chunk_size: Maximum characters per code chunk.
+            doc_chunk_size: Maximum characters per doc chunk.
+            output_dir: Where chunks and indices are saved.
+            use_embeddings: Reserved for future use; has no effect.
+        """
         from src.ingester import Ingester
 
         if max_chunk_size != 2000:
@@ -99,6 +148,14 @@ class CLI:
             print(f"Error during indexing: {exc}")
 
     def search(self, query: str, k: int = 10) -> None:
+        """Search the knowledge base for a single query.
+
+        Uses fast BM25-only retrieval — no reranker.
+
+        Args:
+            query: Search string. Empty query exits cleanly.
+            k: Number of results to retrieve.
+        """
         if not query or not query.strip():
             print("Empty query — no results.")
             return
@@ -118,8 +175,10 @@ class CLI:
             chunk = self.find_chunk(retriever, source)
             print(f"[{i}] filepath: {source.file_path}")
             print(f"    chunk:    {i - 1}")
-            print(f"    range:    {source.first_character_index}:"
-                  f"{source.last_character_index}")
+            print(
+                f"    range:    {source.first_character_index}:"
+                f"{source.last_character_index}"
+            )
             if chunk:
                 preview = chunk.text[:200].replace("\n", " ")
                 print(f"    text:     {preview}...")
@@ -128,14 +187,17 @@ class CLI:
     def search_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/search_results"
                        ) -> None:
-        """Run dual BM25 retrieval over every question in a dataset JSON.
+        """Run classifier-guided retrieval over a dataset JSON.
 
-        Uses separate doc and code indices interleaved — no reranker.
+        Routes each question to the doc or code index via
+        search_smart(), using the reranker only for ambiguous code
+        queries.
 
         Args:
             dataset_path: Path to a RagDataset JSON.
             k: Chunks to retrieve per question.
-            save_directory: Where the StudentSearchResults JSON is written.
+            save_directory: Where the StudentSearchResults JSON is
+                written.
         """
         if not os.path.isfile(dataset_path):
             print(f"Error: dataset file not found: {dataset_path}")
@@ -154,8 +216,6 @@ class CLI:
         results: list[MinimalSearchResults] = []
         for question in tqdm(dataset.rag_questions, desc="Searching"):
             sources = retriever.search_smart(question.question, k=k)
-            if sources is None:
-                sources = []
             results.append(MinimalSearchResults(
                 question_id=question.question_id,
                 question_str=question.question,
@@ -170,6 +230,13 @@ class CLI:
         )
 
     def answer(self, query: str, k: int = 10) -> None:
+        """Answer a single question using retrieved and reranked
+        context.
+
+        Args:
+            query: Natural-language question.
+            k: Number of chunks to retrieve as context.
+        """
         if not query or not query.strip():
             print("Empty query — nothing to answer.")
             return
@@ -185,15 +252,8 @@ class CLI:
             return
 
         parent_map = retriever.get_parent_chunk_map()
-        context_blocks = []
-        for src in sources:
-            parent = parent_map.get(
-                (src.file_path, src.first_character_index)
-            )
-            if parent:
-                context_blocks.append(
-                    f"--- file: {src.file_path} ---\n{parent.text}"
-                )
+        context_blocks = self.build_context_blocks(sources, parent_map)
+
         try:
             generator = self.get_generator()
             response = generator.answer_with_text(query, context_blocks)
@@ -205,21 +265,16 @@ class CLI:
         print("=== Answer ===")
         print(response)
 
-        not_found_phrases = [
-            "not found in the provided sources",
-            "provided sources do not contain",
-            "no relevant information",
-            "i've not found",
-        ]
-        not_found = any(p in response.lower() for p in not_found_phrases)
-        if not not_found:
+        if not self.is_not_found(response):
             print("\n=== Sources ===")
             for i, src in enumerate(sources):
                 chunk = self.find_chunk(retriever, src)
                 print(f"[{i + 1}] filepath: {src.file_path}")
                 print(f"    chunk:    {i}")
-                print(f"    range:    {src.first_character_index}:"
-                      f"{src.last_character_index}")
+                print(
+                    f"    range:    {src.first_character_index}:"
+                    f"{src.last_character_index}"
+                )
                 if chunk:
                     preview = chunk.text[:200].replace("\n", " ")
                     print(f"    text:     {preview}...")
@@ -228,6 +283,16 @@ class CLI:
     def answer_dataset(self, dataset_path: str, k: int = 10,
                        save_directory: str = "data/output/answers",
                        skip_generation: bool = True) -> None:
+        """Full RAG pipeline over an entire dataset:
+        retrieve + rerank + generate.
+
+        Args:
+            dataset_path: Path to a RagDataset JSON.
+            k: Chunks to retrieve per question.
+            save_directory: Where the output JSON is written.
+            skip_generation: If True, saves retrieval results only.
+                Useful for measuring recall@k without the LLM.
+        """
         if not os.path.isfile(dataset_path):
             print(f"Error: dataset file not found: {dataset_path}")
             return
@@ -258,32 +323,24 @@ class CLI:
                 sources = retriever.search_for_generation(
                     question.question, k=k
                 )
-                if sources is None:
-                    sources = []
                 search_only.append(MinimalSearchResults(
                     question_id=question.question_id,
                     question_str=question.question,
                     retrieved_sources=sources,
                 ))
         else:
+            generator = self.generator
+            assert generator is not None
             parent_map = retriever.get_parent_chunk_map()
             for question in tqdm(dataset.rag_questions, desc=desc):
                 sources = retriever.search_for_generation(
                     question.question, k=k
                 )
-                if sources is None:
-                    sources = []
-                context_blocks = []
-                for src in sources:
-                    parent = parent_map.get(
-                        (src.file_path, src.first_character_index)
-                    )
-                    if parent:
-                        context_blocks.append(
-                            f"--- file: {src.file_path} ---\n{parent.text}"
-                        )
+                context_blocks = self.build_context_blocks(
+                    sources, parent_map
+                )
                 try:
-                    response = self.generator.answer_with_text(
+                    response = generator.answer_with_text(
                         question.question, context_blocks
                     )
                 except Exception:
@@ -305,9 +362,7 @@ class CLI:
             )
         else:
             self.save_json(
-                StudentSearchResultsAndAnswer(
-                    search_results=answers, k=k
-                ),
+                StudentSearchResultsAndAnswer(search_results=answers, k=k),
                 save_directory,
                 filename,
                 label="search_results_and_answer",
@@ -315,6 +370,16 @@ class CLI:
 
     def evaluate(self, student_answer_path: str, dataset_path: str,
                  k: int = 10, max_context_length: int = 2000) -> None:
+        """Evaluate retrieval quality using Recall@k vs. ground truth.
+
+        Args:
+            student_answer_path: Path to a StudentSearchResults JSON.
+            dataset_path: Path to the AnsweredQuestions RagDataset
+                JSON.
+            k: Evaluate Recall@1, @3, @5 and @k.
+            max_context_length: Kept for moulinette CLI
+                compatibility; unused.
+        """
         from src.evaluator import Evaluator
 
         if not os.path.isfile(student_answer_path):
@@ -328,21 +393,83 @@ class CLI:
             metrics = evaluator.compute_recall(
                 student_path=student_answer_path,
                 ground_truth_path=dataset_path,
-                k=k)
+                k=k,
+            )
             evaluator.print_report(metrics)
         except Exception as exc:
             print(f"Error during evaluation: {exc}")
 
     @staticmethod
+    def build_context_blocks(sources: list[MinimalSource],
+                             parent_map: dict) -> list[str]:
+        """Build LLM context blocks from in-memory parent chunks.
+
+        Args:
+            sources: Retrieved MinimalSource objects.
+            parent_map: Map from (file_path, first_char) to parent
+                Chunk, as returned by Retriever.get_parent_chunk_map().
+
+        Returns:
+            List of formatted '--- file: path ---\\ntext' blocks.
+        """
+        context_blocks: list[str] = []
+        for src in sources:
+            parent = parent_map.get(
+                (src.file_path, src.first_character_index)
+            )
+            if parent:
+                context_blocks.append(
+                    f"--- file: {src.file_path} ---\n{parent.text}"
+                )
+        return context_blocks
+
+    @staticmethod
+    def is_not_found(response: str) -> bool:
+        """Check whether a generated answer means "not found".
+
+        Args:
+            response: Generated answer text.
+
+        Returns:
+            True if the response indicates no answer was found.
+        """
+        phrases = (
+            "not found in the provided sources",
+            "provided sources do not contain",
+            "no relevant information",
+            "i've not found",
+        )
+        response_lower = response.lower()
+        return any(p in response_lower for p in phrases)
+
+    @staticmethod
     def find_chunk(retriever: Retriever,
                    source: MinimalSource) -> Chunk | None:
+        """Find the Chunk object matching a MinimalSource.
+
+        Args:
+            retriever: The loaded Retriever instance.
+            source: MinimalSource to look up.
+
+        Returns:
+            Matching Chunk or None if not found.
+        """
         chunk_map = retriever.get_chunk_map()
         return chunk_map.get(
-            (source.file_path, source.first_character_index))
+            (source.file_path, source.first_character_index)
+        )
 
     @staticmethod
     def save_json(model: BaseModel, directory: str,
                   filename: str, label: str) -> None:
+        """Serialize a Pydantic model to JSON and write it to disk.
+
+        Args:
+            model: Any Pydantic BaseModel with model_dump_json().
+            directory: Target directory (created if missing).
+            filename: Output filename.
+            label: Human-readable label for the success message.
+        """
         os.makedirs(directory, exist_ok=True)
         out_path = os.path.join(directory, filename)
         try:

@@ -1,29 +1,46 @@
-import os
 import re
 import torch
 from llm_sdk.__init__ import Small_LLM_Model
-from src.models import MinimalSource
+
+NOT_FOUND_PATTERNS = (
+    r"not found in the provided sources",
+    r"i've not found",
+    r"i have not found",
+    r"the provided sources do not contain",
+    r"there is no information",
+    r"no relevant information",
+)
+
+NOT_FOUND_MESSAGE = "Not found in the provided sources."
 
 
 def build_prompt(question: str, context_blocks: list[str]) -> str:
-    """Assemble prompt using Qwen3 chat format with thinking disabled."""
+    """Assemble prompt using Qwen3 chat format with thinking disabled.
+
+    Args:
+        question: The natural-language question.
+        context_blocks: Pre-built context strings, one per source.
+
+    Returns:
+        Full chat-formatted prompt string.
+    """
     context_section = "\n\n".join(context_blocks)
     system = (
-            "You are a technical assistant for the vLLM codebase. "
-            "Answer using ONLY the CONTEXT provided. No prior knowledge.\n\n"
-            "RULES:\n"
-            "1. If the answer is in the CONTEXT: give a direct answer and end"
-            "with 'Source: <filename>'.\n"
-            "2. If the answer is NOT in the CONTEXT: respond with exactly "
-            "'Not found in the provided sources.' Nothing else.\n"
-            "3. Do not infer, guess, or add information not in the "
-            "CONTEXT.\n\n"
-            "EXAMPLES:\n"
-            "Q: What does X do?\n"
-            "A: X does Y. Source: vllm/x.py\n\n"
-            "Q: What is the capital of France?\n"
-            "A: Not found in the provided sources.\n"
-        )
+        "You are a technical assistant for the vLLM codebase. "
+        "Answer using ONLY the CONTEXT provided. No prior knowledge.\n\n"
+        "RULES:\n"
+        "1. If the answer is in the CONTEXT: give a direct answer and "
+        "end with 'Source: <filename>'.\n"
+        "2. If the answer is NOT in the CONTEXT: respond with exactly "
+        "'Not found in the provided sources.' Nothing else.\n"
+        "3. Do not infer, guess, or add information not in the "
+        "CONTEXT.\n\n"
+        "EXAMPLES:\n"
+        "Q: What does X do?\n"
+        "A: X does Y. Source: vllm/x.py\n\n"
+        "Q: What is the capital of France?\n"
+        "A: Not found in the provided sources.\n"
+    )
     user_content = (
         f"CONTEXT:\n{context_section}\n\nQUESTION: {question} /no_think"
     )
@@ -35,25 +52,26 @@ def build_prompt(question: str, context_blocks: list[str]) -> str:
 
 
 class Generator:
-    """Loads Qwen/Qwen3-0.6B and generates grounded answers via greedy
-    decoding.
+    """Loads Qwen/Qwen3-0.6B and generates grounded answers via
+    greedy decoding.
 
-    Greedy decoding picks the highest-logit token at each step, making
-    generation deterministic and faithful to the retrieved context.
+    Greedy decoding picks the highest-logit token at each step,
+    making generation deterministic and faithful to the retrieved
+    context.
 
-    The model is loaded once at construction and reused for all calls.
-    Instantiate once and share via the CLI lazy loader.
+    The model is loaded once at construction and reused for all
+    calls. Instantiate once and share via the CLI lazy loader.
 
     Usage:
         generator = Generator()
-        answer = generator.answer(
-            "How does PagedAttention work?", sources
+        answer = generator.answer_with_text(
+            "How does PagedAttention work?", context_blocks
         )
 
     Attributes:
         model: Loaded Small_LLM_Model instance.
         max_new_tokens: Maximum tokens to generate per answer.
-        repo_root: Used to read chunk text from disk.
+        repo_root: Root of the vLLM repo (kept for compatibility).
     """
 
     MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -63,9 +81,10 @@ class Generator:
         """Load the LLM. First run downloads weights (~600 MB).
 
         Args:
-            max_new_tokens: Cap on generated tokens per answer.
-                Keep low (100-200) — each token costs a full forward pass.
-            repo_root: Root of the vLLM repo for reading chunk text.
+            max_new_tokens: Cap on generated tokens per answer. Keep
+                low (100-200) — each token costs a full forward pass.
+            repo_root: Root of the vLLM repo, kept for backward
+                compatibility with callers that pass it.
         """
         print(f"Loading {self.MODEL_NAME}...")
         self.model = Small_LLM_Model(model_name=self.MODEL_NAME)
@@ -73,96 +92,41 @@ class Generator:
         self.repo_root = repo_root
         print("Model loaded.")
 
-    def answer(self, question: str, sources: list[MinimalSource]) -> str:
-        """Generate a grounded answer for a question given retrieved sources.
+    def answer_with_text(self, question: str,
+                         context_blocks: list[str]) -> str:
+        """Generate a grounded answer from pre-built context blocks.
 
         Args:
             question: The natural-language question.
-            sources: Retrieved MinimalSource objects from the Retriever.
+            context_blocks: Pre-built context strings, one per
+                source, typically built from parent chunks already
+                held in memory by the Retriever.
 
         Returns:
             A concise, source-grounded answer string.
         """
         if not question or not question.strip():
             return "No question provided."
-        if not sources:
-            return "No relevant sources found."
-
-        context_blocks = self.build_context_blocks(sources)
         if not context_blocks:
-            return "Could not read source content from disk."
+            return "No relevant sources found."
 
         prompt = build_prompt(question, context_blocks)
         prompt = self.truncate_prompt(prompt)
         return self.greedy_decode(prompt)
 
-    def answer_batch(self, questions: list[str],
-                     sources_list: list[list[MinimalSource]]) -> list[str]:
-        """Generate answers for multiple questions.
+    def truncate_prompt(self, prompt: str,
+                        max_chars: int = 10000) -> str:
+        """Truncate the prompt to stay within a reasonable token
+        budget.
 
-        Args:
-            questions: List of question strings.
-            sources_list: Parallel list of retrieved sources per question.
-
-        Returns:
-            List of answer strings in the same order as input.
-        """
-        answers: list[str] = []
-        for question, sources in zip(questions, sources_list):
-            try:
-                answers.append(self.answer(question, sources))
-            except Exception:
-                answers.append("Error generating answer.")
-        return answers
-
-    def build_context_blocks(self, sources: list[MinimalSource]) -> list[str]:
-        """Read the actual text for each source from disk and format it.
-
-        Args:
-            sources: Retrieved source objects with file_path and char indices.
-
-        Returns:
-            List of formatted strings: '--- file: path ---\\nchunk text'.
-        """
-        blocks: list[str] = []
-        for source in sources:
-            text = self.read_chunk_text(source)
-            if text:
-                blocks.append(f"--- file: {source.file_path} ---\n{text}")
-        return blocks
-
-    def read_chunk_text(self, source: MinimalSource) -> str:
-        """Extract the exact text slice from the source file on disk.
-
-        Args:
-            source: MinimalSource with file_path and character indices.
-
-        Returns:
-            The text slice, or empty string if the file cannot be read.
-        """
-        abs_path = os.path.join(self.repo_root, source.file_path)
-        if not os.path.isfile(abs_path):
-            abs_path = source.file_path
-        try:
-            with open(
-                abs_path, "r", encoding="utf-8", errors="ignore"
-            ) as fh:
-                content = fh.read()
-            return content[
-                source.first_character_index:source.last_character_index
-            ]
-        except (OSError, IndexError):
-            return ""
-
-    def truncate_prompt(self, prompt: str, max_chars: int = 10000) -> str:
-        """Truncate the prompt to stay within a reasonable token budget.
-
-        Keeps the system prompt and question intact; truncates only the
-        middle context section so the model always sees the full question.
+        Keeps the system prompt and question intact; truncates only
+        the middle context section so the model always sees the
+        full question.
 
         Args:
             prompt: Full assembled prompt.
-            max_chars: Approximate character budget (1 token ≈ 4 chars).
+            max_chars: Approximate character budget (1 token ~= 4
+                chars).
 
         Returns:
             Prompt truncated to max_chars if necessary.
@@ -177,28 +141,13 @@ class Generator:
         budget = max_chars - len(tail)
         return prompt[:budget] + "\n[context truncated]\n" + tail
 
-    def answer_with_text(self, question: str,
-                         context_blocks: list[str]) -> str:
-        """Generate answer with pre-built context blocks.
-
-        Args:
-            question: The natural-language question.
-            context_blocks: Pre-built context strings.
-
-        Returns:
-            A concise, source-grounded answer string.
-        """
-        if not question or not question.strip():
-            return "No question provided."
-        if not context_blocks:
-            return "No relevant sources found."
-
-        prompt = build_prompt(question, context_blocks)
-        prompt = self.truncate_prompt(prompt)
-        return self.greedy_decode(prompt)
-
     def greedy_decode(self, prompt: str) -> str:
-        """Generate text using HuggingFace's native generate() with KV-cache.
+        """Generate text using HuggingFace's generate() with
+        KV-cache.
+
+        Strips the model's thinking block, then normalises any
+        "no answer" phrasing to a single canonical message so
+        downstream callers can match on it reliably.
 
         Args:
             prompt: The full prompt string to continue from.
@@ -206,7 +155,6 @@ class Generator:
         Returns:
             Generated text (new tokens only, prompt excluded).
         """
-
         inputs = self.model._tokenizer(
             prompt,
             return_tensors="pt",
@@ -228,20 +176,12 @@ class Generator:
         new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
         text = self.model.decode(new_ids).strip()
 
-        # Strip thinking block
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
         text = text.strip()
-        not_found_patterns = [
-            r"not found in the provided sources",
-            r"i've not found",
-            r"i have not found",
-            r"the provided sources do not contain",
-            r"there is no information",
-            r"no relevant information",
-            ]
+
         text_lower = text.lower()
-        for pattern in not_found_patterns:
+        for pattern in NOT_FOUND_PATTERNS:
             if re.search(pattern, text_lower):
-                return "Not found in the provided sources."
+                return NOT_FOUND_MESSAGE
 
         return text
